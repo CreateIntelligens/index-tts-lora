@@ -9,7 +9,7 @@ from loguru import logger
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader, Dataset
 
-# 导入与infer.py相同的文本处理类
+# 匯入與infer.py相同的文字處理類
 from indextts.utils.front import TextNormalizer, TextTokenizer
 
 
@@ -29,7 +29,7 @@ class FinetuneDataset(Dataset):
         self.config = config
         self.data = []
         
-        # 使用与infer.py完全相同的文本处理器
+        # 使用與infer.py完全相同的文字處理器
         self.normalizer = TextNormalizer()
         self.normalizer.load()
         self.tokenizer = TextTokenizer(bpe_path, self.normalizer)
@@ -37,20 +37,20 @@ class FinetuneDataset(Dataset):
         print(">> TextNormalizer loaded for training")
         print(f">> BPE model loaded from: {bpe_path}")
         
-        # 加载所有说话人的数据
+        # 載入所有說話人的資料
         for manifest_file, speaker_id in zip(manifest_files, speaker_ids):
             logger.info(f"Loading data from manifest: {manifest_file} for speaker: {speaker_id}")
             with open(manifest_file, "r", encoding="utf-8") as f:
                 for line in f:
                     if line.strip():
-                        # 根据音频时长过滤数据
+                        # 根據音訊時長過濾資料
                         item = json.loads(line.strip())
 
                         duration = item.get("duration", 0)
                         if duration > 20 or duration < 1:
                             continue
 
-                        item['speaker_id'] = speaker_id  # 添加说话人ID
+                        item['speaker_id'] = speaker_id  # 新增說話人ID
                         self.data.append(item)
         
         logger.info(f"Loaded {len(self.data)} samples from {len(manifest_files)} speakers.")
@@ -67,13 +67,13 @@ class FinetuneDataset(Dataset):
         condition_path = item.get("condition", None)
         speaker_id = item["speaker_id"]
 
-        # 使用与infer.py完全相同的文本处理流程
-        # 这确保训练和推理时的文本处理完全一致
-        text_tokens_list = self.tokenizer.tokenize(text)  # 这里会调用normalize + tokenize_by_CJK_char
+        # 使用與infer.py完全相同的文字處理流程
+        # 這確保訓練和推理時的文字處理完全一致
+        text_tokens_list = self.tokenizer.tokenize(text)  # 這裡會呼叫normalize + tokenize_by_CJK_char
         text_ids = self.tokenizer.convert_tokens_to_ids(text_tokens_list)
         text_ids = torch.LongTensor(text_ids).unsqueeze(0)
 
-        # 加载音频特征
+        # 載入音訊特徵
         codes_npy = np.load(codes_path)
         mels_npy = np.load(mels_path)
         condition_npy = np.load(condition_path) if condition_path else None
@@ -117,14 +117,14 @@ def _pad_sequence(seqs, pad_value=0, dim=-1):
     padded = seqs[0].new_full(out_shape, pad_value)
 
     for i, s in enumerate(seqs):
-        # 在最后一维进行padding，复制原始数据到对应位置
+        # 在最後一維進行padding，複製原始資料到對應位置
         if s.dim() == 1:  # 1D tensor: [L] -> [B, L]
             padded[i, :s.shape[0]] = s
         elif s.dim() == 2:  # 2D tensor: [D, L] -> [B, D, L]
             padded[i, :, :s.shape[1]] = s
         elif s.dim() == 3:  # 3D tensor: [C, D, L] -> [B, C, D, L]
             padded[i, :, :, :s.shape[2]] = s
-        else:  # 4D及以上维度
+        else:  # 4D及以上維度
             padded[i, ..., :s.shape[-1]] = s
 
     return padded, lengths
@@ -193,7 +193,7 @@ def load_finetune_datasets(config: DictConfig, bpe_path: str) -> Tuple[Dataset, 
     Returns:
         Tuple[Dataset, Dataset]: ``(train_dataset, validation_dataset)``.
     """
-    # 读取说话人信息
+    # 讀取說話人資訊
     speaker_info_path = os.path.join(config.train.data_path, "speaker_info.json")
     with open(speaker_info_path, 'r', encoding='utf-8') as f:
         speaker_info_list = json.load(f)
@@ -202,7 +202,7 @@ def load_finetune_datasets(config: DictConfig, bpe_path: str) -> Tuple[Dataset, 
     valid_manifest_files = []
     speaker_ids = []
     
-    # 收集所有说话人的训练和验证数据文件
+    # 收集所有說話人的訓練和驗證資料檔案
     for speaker_info in speaker_info_list:
         speaker_id = speaker_info['speaker']
 
@@ -217,7 +217,7 @@ def load_finetune_datasets(config: DictConfig, bpe_path: str) -> Tuple[Dataset, 
         else:
             logger.warning(f"Missing metadata files for speaker {speaker_id}")
     
-    # 创建数据集
+    # 建立資料集
     train_dataset = FinetuneDataset(train_manifest_files, bpe_path, speaker_ids, config)
     valid_dataset = FinetuneDataset(valid_manifest_files, bpe_path, speaker_ids, config)
     
@@ -225,7 +225,7 @@ def load_finetune_datasets(config: DictConfig, bpe_path: str) -> Tuple[Dataset, 
 
 
 def load_speaker_conditions(config: DictConfig) -> dict:
-    """加载所有说话人的mean_condition。
+    """載入所有說話人的mean_condition。
     
     Args:
         config (DictConfig): Global configuration.
@@ -263,7 +263,7 @@ if __name__ == "__main__":
     # Load config file
     config = OmegaConf.load(args.config)
 
-    # Load datasets (现在直接传递BPE路径)
+    # Load datasets (現在直接傳遞BPE路徑)
     train_dataset, valid_dataset = load_finetune_datasets(config, args.bpe_model)
 
     logger.info(f"Train dataset size: {len(train_dataset)}")

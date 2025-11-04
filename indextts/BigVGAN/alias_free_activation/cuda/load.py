@@ -19,12 +19,12 @@ import re
 import shutil
 import tempfile
 
-# 补丁修复：sources 路径含中文字符时，生成 build.ninja 乱码导致编译失败
-# 使用临时目录来规避 ninja 编译失败（比如中文路径）
+# 補丁修復：sources 路徑含中文字元時，生成 build.ninja 亂碼導致編譯失敗
+# 使用臨時目錄來規避 ninja 編譯失敗（比如中文路徑）
 def chinese_path_compile_support(sources, buildpath):
     pattern = re.compile(r'[\u4e00-\u9fff]')  
     if not bool(pattern.search(str(sources[0].resolve()))):
-        return buildpath # 检测非中文路径跳过
+        return buildpath # 檢測非中文路徑跳過
     # Create build directory
     resolves = [ item.name for item in sources]
     ninja_compile_dir = os.path.join(tempfile.gettempdir(), "BigVGAN", "cuda")
@@ -76,7 +76,7 @@ def load(force_rebuild=False):
         return module
 
     if platform.system() == "Windows" and "MINGW64" in os.environ.get("MSYSTEM", ""):
-        # 在 MinGW-w64 (如 Git Bash) 环境下编译 CUDA 扩展可能会阻塞或失败
+        # 在 MinGW-w64 (如 Git Bash) 環境下編譯 CUDA 擴充套件可能會阻塞或失敗
         # https://github.com/index-tts/index-tts/issues/172#issuecomment-2914995096
         print("Warning: Detected running in MinGW-w64 (e.g., Git Bash). CUDA extension build is not supported in this environment.", file=sys.stderr)
         raise RuntimeError(
@@ -123,7 +123,7 @@ def load(force_rebuild=False):
         srcpath / "anti_alias_activation_cuda.cu",
     ]
     
-    # 兼容方案：ninja 特殊字符路径编译支持处理（比如中文路径）
+    # 相容方案：ninja 特殊字元路徑編譯支援處理（比如中文路徑）
     buildpath = chinese_path_compile_support(sources, buildpath)
     
     anti_alias_activation_cuda = _cpp_extention_load_helper(

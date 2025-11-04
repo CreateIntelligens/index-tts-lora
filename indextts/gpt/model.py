@@ -390,7 +390,7 @@ class UnifiedVoice(nn.Module):
         for module in embeddings:
             module.weight.data.normal_(mean=0.0, std=.02)
             
-        # 初始化 mean_condition 为 None，后续可以设置
+        # 初始化 mean_condition 為 None，後續可以設定
         self.mean_condition = None
 
     def post_init_gpt2_config(self, use_deepspeed=False, kv_cache=False, half=False):
@@ -496,12 +496,12 @@ class UnifiedVoice(nn.Module):
             return first_logits
 
     def get_conditioning(self, speech_conditioning_input, cond_mel_lengths=None, speaker_ids=None):
-        # 如果设置了多说话人的 mean_condition，根据 speaker_id 选择对应的条件向量
+        # 如果設定了多說話人的 mean_condition，根據 speaker_id 選擇對應的條件向量
         if speaker_ids is not None:
             batch_size = len(speaker_ids)
             device = speech_conditioning_input.device if speech_conditioning_input is not None else next(self.parameters()).device
             
-            # 为每个样本选择对应说话人的 mean_condition
+            # 為每個樣本選擇對應說話人的 mean_condition
             conds_list = []
             for speaker_id in speaker_ids:
                 param_name = f'mean_condition_{speaker_id}'
@@ -509,7 +509,7 @@ class UnifiedVoice(nn.Module):
                     speaker_condition = getattr(self, param_name)
                     if speaker_condition.device != device:
                         speaker_condition = speaker_condition.to(device)
-                    # 确保是3维张量 (1, 32, dim)
+                    # 確保是3維張量 (1, 32, dim)
                     if speaker_condition.ndim == 2:
                         speaker_condition = speaker_condition.unsqueeze(0)
                     elif speaker_condition.ndim == 4:
@@ -518,21 +518,21 @@ class UnifiedVoice(nn.Module):
                 else:
                     raise ValueError(f"No condition found for speaker {speaker_id}")
             
-            # 将所有条件堆叠成批次 (batch_size, 32, dim)
+            # 將所有條件堆疊成批次 (batch_size, 32, dim)
             return torch.cat(conds_list, dim=0)
         
-        # 如果设置了单一的 mean_condition，直接返回固定的条件向量
+        # 如果設定了單一的 mean_condition，直接返回固定的條件向量
         if hasattr(self, 'mean_condition') and self.mean_condition is not None:
             batch_size = speech_conditioning_input.shape[0] if speech_conditioning_input is not None else 1
             device = speech_conditioning_input.device if speech_conditioning_input is not None else next(self.parameters()).device
-            # 确保 mean_condition 在正确的设备上
+            # 確保 mean_condition 在正確的裝置上
             if self.mean_condition.device != device:
                 logger.info(f"Warning: mean_condition device mismatch. Moving from {self.mean_condition.device} to {device}")
                 self.mean_condition = self.mean_condition.to(device)
-            # 直接扩展到批次大小
+            # 直接擴充套件到批次大小
             return self.mean_condition.expand(batch_size, -1, -1)
         
-        # 原有的动态计算逻辑
+        # 原有的動態計算邏輯
         if self.condition_type == "perceiver":
             if speech_conditioning_input.ndim == 4:
                 speech_conditioning_input = speech_conditioning_input.squeeze(1)

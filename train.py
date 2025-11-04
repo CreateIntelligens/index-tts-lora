@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import sentencepiece as spm
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
 from omegaconf import DictConfig, OmegaConf
@@ -26,9 +27,17 @@ from indextts.data_utils import (
 )
 from indextts.gpt.model import UnifiedVoice
 
+# Import GPU Manager
+try:
+    from indextts.gpu_manager import GPUManager, get_global_gpu_manager
+    GPU_MANAGER_AVAILABLE = True
+except ImportError:
+    GPU_MANAGER_AVAILABLE = False
+    logger.warning("⚠️  GPU Manager not available, multi-GPU support disabled")
+
 
 def load_UnifiedVoice(gpt_config: DictConfig, gpt_checkpoint_path: str, device: torch.device) -> UnifiedVoice:
-    """加载 UnifiedVoice 模型权重。"""
+    """載入 UnifiedVoice 模型權重。"""
     state_dict = torch.load(gpt_checkpoint_path, map_location=device, weights_only=True)
     state_dict = state_dict["model"] if "model" in state_dict else state_dict
     model = UnifiedVoice(**gpt_config)
@@ -38,7 +47,7 @@ def load_UnifiedVoice(gpt_config: DictConfig, gpt_checkpoint_path: str, device: 
     return model.to(device)
 
 def clear_torch_cache():
-    """清理 GPU 缓存。"""
+    """清理 GPU 快取。"""
     if torch.cuda.is_available():
         logger.info("Clearing CUDA cache...")
         # logger.info(f"{torch.cuda.memory_reserved() / (1024**2):.2f} MiB reserved")
@@ -59,7 +68,7 @@ def forward_gpt2(
 ):
     assert attention_mask is not None, "Attention mask must be provided for UnifiedVoice forward pass."
 
-    """UnifiedVoice GPT2 部分的前向传播。"""
+    """UnifiedVoice GPT2 部分的前向傳播。"""
     b = inputs_embeds.shape[0]
     gpt_out = model.gpt(inputs_embeds=inputs_embeds, attention_mask=attention_mask, return_dict=True)
     hidden_state = gpt_out.last_hidden_state
@@ -135,16 +144,16 @@ def forward_UnifiedVoice(
     mel_lengths: torch.LongTensor,
     codes_lengths: torch.LongTensor,
     text_lengths: torch.LongTensor,
-    speaker_ids: List[str] = None,  # 新增参数
+    speaker_ids: List[str] = None,  # 新增引數
     add_mel_stop_token: bool = True,
     output_loss: bool = True,
     output_logits: bool = True,
     output_latent: bool = False,
     loss_reduction: str = "mean",
 ):
-    """UnifiedVoice 模型的完整前向传播。"""
+    """UnifiedVoice 模型的完整前向傳播。"""
 
-    conditioning_latent = model.get_conditioning(mel_spec, mel_lengths, speaker_ids=speaker_ids)  # 传递 speaker_ids
+    conditioning_latent = model.get_conditioning(mel_spec, mel_lengths, speaker_ids=speaker_ids)  # 傳遞 speaker_ids
     
     # -------- build text_inputs with start/stop tokens --------
     B, T_pad = text_ids.shape
@@ -271,7 +280,7 @@ def forward_UnifiedVoice(
     return outputs
 
 def top_k_accuracy(logits: torch.Tensor, targets: torch.Tensor, k: Tuple[int, ...] = (1, 10, 20)) -> List[float]:
-    """计算 top-k 准确率。"""
+    """計算 top-k 準確率。"""
     max_k = max(k)
     _, topk_preds = torch.topk(logits, max_k, dim=1)  # (B*L, max_k)
     
@@ -291,38 +300,56 @@ def top_k_accuracy(logits: torch.Tensor, targets: torch.Tensor, k: Tuple[int, ..
     return res
 
 class Trainer:
-    """封装 UnifiedVoice 微调过程的训练器。"""
-    def __init__(self, config: DictConfig):
+    """封裝 UnifiedVoice 微調過程的訓練器。"""
+    def __init__(self, config: DictConfig, use_multi_gpu: bool = True):
         """
-        初始化训练器。
+        初始化訓練器。
 
         Args:
-            config (DictConfig): 从 YAML 文件加载的 OmegaConf 配置对象。
+            config (DictConfig): 從 YAML 檔案載入的 OmegaConf 配置物件。
+            use_multi_gpu (bool): 是否啟用多 GPU 訓練（預設 True）
         """
         self.config = config
+        self.use_multi_gpu = use_multi_gpu and GPU_MANAGER_AVAILABLE
+        self.gpu_manager = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # 设置随机种子
+
+        # 初始化 GPU Manager
+        if self.use_multi_gpu and torch.cuda.is_available():
+            try:
+                self.gpu_manager = get_global_gpu_manager()
+                gpu_count = self.gpu_manager.get_gpu_count()
+                if gpu_count > 1:
+                    logger.info(f"🎮 多 GPU 訓練模式：偵測到 {gpu_count} 個 GPU")
+                    self.gpu_manager.print_summary()
+                elif gpu_count == 1:
+                    logger.info("🎮 單 GPU 訓練模式")
+                    self.use_multi_gpu = False
+            except Exception as e:
+                logger.warning(f"⚠️  GPU Manager 初始化失敗: {e}")
+                self.use_multi_gpu = False
+
+        # 設定隨機種子
         self._set_seed(self.config.train.seed)
 
-        # 准备目录和日志
+        # 準備目錄和日誌
         self.finetune_dir = self.config.train.finetune_model_dir
         self.checkpoint_dir = os.path.join(self.finetune_dir, "checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self._setup_logging()
 
-        # 加载说话人条件向量
+        # 載入說話人條件向量
         self.speaker_conditions = load_speaker_conditions(config)
         self.speaker_list = list(self.speaker_conditions.keys())
         logger.info(f"Loaded conditions for {len(self.speaker_list)} speakers: {self.speaker_list}")
 
-        # 加载模型和分词器
+        # 載入模型和分詞器
         self._load_models()
 
-        # 设置优化器和调度器
+        # 設定最佳化器和排程器
         self._setup_optimizer_and_scheduler()
 
-        # 初始化训练状态
+        # 初始化訓練狀態
         self.best_val_loss = (0, float('inf'), float('inf'))  # (epoch, text_loss, mel_loss)
         self.update_steps = 0
 
@@ -334,21 +361,21 @@ class Trainer:
         logger.info(f"Set random seed to {seed}")
 
     def _setup_logging(self):
-        """配置 loguru 日志记录器。"""
+        """配置 loguru 日誌記錄器。"""
         log_path = os.path.join(self.checkpoint_dir, f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
         logger.add(log_path, level="INFO", encoding="utf-8")
         logger.info("Logging configured. Logs will be saved to console and file.")
         logger.info("Full configuration:\n" + OmegaConf.to_yaml(self.config))
 
     def _load_models(self):
-        """加载 BPE、BigVGAN 和 UnifiedVoice 模型。"""
+        """載入 BPE、BigVGAN 和 UnifiedVoice 模型。"""
         logger.info("Loading models...")
         # BPE
         bpe_model_path = os.path.join(self.finetune_dir, self.config.dataset.bpe_model)
         self.bpe_model = spm.SentencePieceProcessor(bpe_model_path)
         logger.info("BPE model loaded.")
         
-        # BigVGAN (用于可能的推理测试)
+        # BigVGAN (用於可能的推理測試)
         # bigvgan_checkpoint_path = os.path.join(self.finetune_dir, self.config.bigvgan_checkpoint)
         # self.bigvgan = BigVGAN(self.config.bigvgan)
         # bigvgan_state_dict = torch.load(bigvgan_checkpoint_path, map_location="cpu", weights_only=True)["generator"]
@@ -363,33 +390,43 @@ class Trainer:
         self.model = load_UnifiedVoice(self.config.gpt, gpt_checkpoint_path, self.device)
         logger.info("UnifiedVoice base model loaded.")
     
-        # 应用 LoRA（这会冻结所有参数）
+        # 應用 LoRA（這會凍結所有引數）
         self.model = self._apply_lora(self.model)
         logger.info("LoRA applied to the model.")
-        
-        # 注册多说话人的mean_condition作为可学习参数
+
+        # 多 GPU 支援：使用 DataParallel 包裝模型
+        if self.use_multi_gpu and self.gpu_manager and self.gpu_manager.get_gpu_count() > 1:
+            logger.info("🚀 使用 DataParallel 包裝模型進行多 GPU 訓練")
+            self.model = nn.DataParallel(self.model)
+            logger.info(f"  模型已分散到 {torch.cuda.device_count()} 個 GPU")
+
+        # 註冊多說話人的mean_condition作為可學習引數
         self.speaker_mean_conditions = {}
+
+        # 獲取實際模型（處理 DataParallel 包裝）
+        actual_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+
         for speaker_id, condition in self.speaker_conditions.items():
-            # 验证和调整形状
+            # 驗證和調整形狀
             if condition.ndim == 2:  # (32, dim) -> (1, 32, dim)
                 condition = condition.unsqueeze(0)
             elif condition.ndim != 3:
                 raise ValueError(f"Expected condition tensor to have 2 or 3 dimensions, got {condition.ndim} for speaker {speaker_id}")
-            
-            # 将每个说话人的condition注册为可学习参数
+
+            # 將每個說話人的condition註冊為可學習引數
             param_name = f"mean_condition_{speaker_id}"
             param = torch.nn.Parameter(condition.to(self.device), requires_grad=True)
-            
-            # 使用正确的方式注册参数
-            self.model.register_parameter(param_name, param)
+
+            # 使用正確的方式註冊引數（註冊到實際模型）
+            actual_model.register_parameter(param_name, param)
             self.speaker_mean_conditions[speaker_id] = param
-            
+
             logger.debug(f"Registered parameter {param_name} with shape {param.shape}")
-        
+
         logger.info(f"Loaded and registered {len(self.speaker_mean_conditions)} speaker conditions.")
 
     def _apply_lora(self, model: UnifiedVoice) -> UnifiedVoice:
-        """为模型配置并应用 LoRA。"""
+        """為模型配置並應用 LoRA。"""
         lora_cfg = self.config.train.lora
         gpt_lora_config = LoraConfig(
             r=lora_cfg.r,
@@ -404,7 +441,7 @@ class Trainer:
         return model
 
     def _setup_optimizer_and_scheduler(self, num_training_steps: int = 1000):
-        """创建优化器和学习率调度器。"""
+        """建立最佳化器和學習率排程器。"""
         opt_cfg = self.config.train.optimizer
         optimizer = create_loraplus_optimizer(
             model=self.model,
@@ -423,10 +460,10 @@ class Trainer:
         self.scheduler = scheduler
         logger.info("Optimizer (LoRA+) and Scheduler (CosineAnnealingWithWarmup) created.")
 
-    def _train_step(self, data_batch: tuple) -> Tuple[torch.Tensor, torch.Tensor, dict]:  # 修正：应该返回三个值
-        """执行单个训练步骤（前向和后向传播）。"""
+    def _train_step(self, data_batch: tuple) -> Tuple[torch.Tensor, torch.Tensor, dict]:  # 修正：應該返回三個值
+        """執行單個訓練步驟（前向和後向傳播）。"""
         self.model.train()
-        self.model.inference_model.kv_cache = False  # 训练时禁用 KV 缓存
+        self.model.inference_model.kv_cache = False  # 訓練時停用 KV 快取
     
         # Unpack data_batch: mel_spec, mel_codes, text_ids, conditions, speaker_ids, mel_lengths, codes_lengths, text_lengths
         mel_spec, mel_codes, text_ids, conditions, speaker_ids, mel_lengths, codes_lengths, text_lengths = data_batch
@@ -438,7 +475,7 @@ class Trainer:
             mel_lengths,
             codes_lengths,
             text_lengths,
-            speaker_ids=speaker_ids,  # 确保这一行存在
+            speaker_ids=speaker_ids,  # 確保這一行存在
             output_loss=True,
             output_logits=True,
         )
@@ -448,7 +485,7 @@ class Trainer:
 
     @torch.no_grad()
     def _validate_epoch(self, valid_ds: Dataset, epoch: int):
-        """在验证集上评估模型。"""
+        """在驗證集上評估模型。"""
         self.model.eval()
         logger.info(f"Validating at epoch {epoch + 1}...")
         
@@ -458,15 +495,15 @@ class Trainer:
         num_batches = 0
 
         for batch in tqdm(valid_ds, desc="Validation", dynamic_ncols=True):
-            # 正确处理新的 data_batch 格式，区分 tensor 和非 tensor 数据
+            # 正確處理新的 data_batch 格式，區分 tensor 和非 tensor 資料
             data_batch = []
             for item in batch:
                 if torch.is_tensor(item):
                     data_batch.append(item.to(self.device))
                 else:
-                    data_batch.append(item)  # speaker_ids 是字符串列表，不需要 .to(device)
+                    data_batch.append(item)  # speaker_ids 是字串列表，不需要 .to(device)
 
-            # 正确解包新格式：mel_spec, mel_codes, text_ids, conditions, speaker_ids, mel_lengths, codes_lengths, text_lengths
+            # 正確解包新格式：mel_spec, mel_codes, text_ids, conditions, speaker_ids, mel_lengths, codes_lengths, text_lengths
             mel_spec, mel_codes, text_ids, conditions, speaker_ids, mel_lengths, codes_lengths, text_lengths = data_batch
             
             outputs = forward_UnifiedVoice(
@@ -477,7 +514,7 @@ class Trainer:
                 mel_lengths,
                 codes_lengths,
                 text_lengths,
-                speaker_ids=speaker_ids,  # 添加这一行
+                speaker_ids=speaker_ids,  # 新增這一行
                 output_loss=True,
                 output_logits=True,
             )
@@ -493,7 +530,7 @@ class Trainer:
             num_batches += 1
 
             # Collect logits and targets for accuracy calculation
-            # 仅使用 MEL 部分的 logits 和 targets
+            # 僅使用 MEL 部分的 logits 和 targets
             current_mel_logits = outputs["logits"][1]  # mel logits [B, V, L]
             current_mel_targets = outputs["targets"][1]  # mel targets [B, L]
             if current_mel_logits.numel() > 0 and current_mel_targets.numel() > 0:
@@ -516,7 +553,7 @@ class Trainer:
         avg_text_loss = total_text_loss / total_text_tokens
         avg_mel_loss = total_mel_loss / total_mel_tokens
         
-        # 计算整体准确率
+        # 計算整體準確率
         all_mel_logits = torch.cat(all_mel_logits, dim=0)
         all_mel_targets = torch.cat(all_mel_targets, dim=0)
         acc_1, acc_10, acc_20 = top_k_accuracy(all_mel_logits, all_mel_targets, k=(1, 10, 20))
@@ -528,7 +565,7 @@ class Trainer:
         return avg_text_loss, avg_mel_loss, acc_1, acc_10, acc_20
 
     def _save_checkpoint(self, file_name: str, merge_lora: bool, unload_after_merge: bool):
-        """保存模型检查点，包含说话人信息。"""
+        """儲存模型檢查點，包含說話人資訊。"""
         checkpoint_path = os.path.join(self.checkpoint_dir, file_name)
         
         self.model.eval()
@@ -538,24 +575,24 @@ class Trainer:
         if merge_lora:
             logger.info("Merging LoRA weights into the model for saving...")
             if unload_after_merge:
-                # 为了在不影响继续训练的情况下保存完全融合的模型，我们创建一个深拷贝
-                # 注意：这可能会消耗较多内存和时间
+                # 為了在不影響繼續訓練的情況下儲存完全融合的模型，我們建立一個深複製
+                # 注意：這可能會消耗較多記憶體和時間
                 logger.info("Creating a deep copy of the model for a clean merge. This may take a moment...")
                 model_to_save = copy.deepcopy(self.model)
                 
-                # 在深拷贝上进行融合与卸载
+                # 在深複製上進行融合與解除安裝
                 fused_inference_model = model_to_save.inference_model.merge_and_unload()
                 model_to_save.inference_model = fused_inference_model
                 logger.info("LoRA weights merged and unloaded in the copied model.")
             else:
-                # 如果只是临时融合，直接在原模型上操作，后续再unmerge
+                # 如果只是臨時融合，直接在原模型上操作，後續再unmerge
                 self.model.inference_model.merge_adapter()
     
-        # 保存模型状态和说话人信息
+        # 儲存模型狀態和說話人資訊
         state_dict = model_to_save.state_dict()
         checkpoint_data = {
             'model': state_dict,
-            'speakers': self.speaker_list,  # 保存说话人列表
+            'speakers': self.speaker_list,  # 儲存說話人列表
             'speaker_conditions': {speaker_id: param.detach().cpu().numpy() 
                                  for speaker_id, param in self.speaker_mean_conditions.items()}
         }
@@ -564,13 +601,13 @@ class Trainer:
         logger.info(f"Checkpoint saved to: {checkpoint_path}")
         logger.info(f"Saved conditions for speakers: {self.speaker_list}")
     
-        # 如果创建了深拷贝，清理它
+        # 如果建立了深複製，清理它
         if merge_lora and unload_after_merge:
             del model_to_save
             clear_torch_cache()
             logger.info("Cleaned up the temporary merged model.")
         
-        # 如果是临时融合，恢复模型状态以便继续训练
+        # 如果是臨時融合，恢復模型狀態以便繼續訓練
         if merge_lora and not unload_after_merge:
             logger.info("Unmerging LoRA weights to continue training...")
             self.model.inference_model.unmerge_adapter()
@@ -579,11 +616,11 @@ class Trainer:
 
     def train(self, train_ds: Dataset, valid_ds: Dataset):
         """
-        启动完整的训练流程。
+        啟動完整的訓練流程。
 
         Args:
-            train_ds (Dataset): 训练数据集。
-            valid_ds (Dataset): 验证数据集。
+            train_ds (Dataset): 訓練資料集。
+            valid_ds (Dataset): 驗證資料集。
         """
         train_cfg = self.config.train
         total_ds_count = len(train_ds)
@@ -602,13 +639,13 @@ class Trainer:
             logger.info(f"EPOCH {epoch + 1}/{train_cfg.epochs} started" + "=" * 30)
 
             for batch_idx, batch in enumerate(train_ds):
-                # 正确处理新的 data_batch 格式，区分 tensor 和非 tensor 数据
+                # 正確處理新的 data_batch 格式，區分 tensor 和非 tensor 資料
                 data_batch = []
                 for item in batch:
                     if torch.is_tensor(item):
                         data_batch.append(item.to(self.device))
                     else:
-                        data_batch.append(item)  # speaker_ids 是字符串列表，不需要 .to(device)
+                        data_batch.append(item)  # speaker_ids 是字串列表，不需要 .to(device)
 
                 loss_text, loss_mel, mel_accuracy = self._train_step(tuple(data_batch))
                 acc_1, acc_10, acc_20 = mel_accuracy["acc_1"], mel_accuracy["acc_10"], mel_accuracy["acc_20"]
@@ -637,12 +674,12 @@ class Trainer:
             # --- Epoch End ---
             val_text_loss, val_mel_loss, _, _, _ = self._validate_epoch(valid_ds, epoch)
             
-            # 每个epoch结束后都保存当前模型
+            # 每個epoch結束後都儲存當前模型
             epoch_checkpoint_name = f"gpt_epoch_{epoch + 1}.pth"
             logger.info(f"Saving model for epoch {epoch + 1}: {epoch_checkpoint_name}")
             self._save_checkpoint(epoch_checkpoint_name, merge_lora=True, unload_after_merge=True)
             
-            # 检查早停
+            # 檢查早停
             #patience = train_cfg.early_stopping_patience
             #if epoch > 0 and val_mel_loss >= self.best_val_loss[2] and (epoch - self.best_val_loss[0]) >= patience:
             #    logger.info(
@@ -661,7 +698,7 @@ class Trainer:
         logger.info("Training finished. Saving final model.")
         self._save_checkpoint("gpt_finetuned.pth", merge_lora=True, unload_after_merge=True)
         
-        # 保存最终配置
+        # 儲存最終配置
         final_config_path = os.path.join(self.finetune_dir, "config_finetuned.yaml")
         final_config = self.config.copy()
         final_config.gpt_checkpoint = "checkpoints/gpt_finetuned.pth"
@@ -679,7 +716,7 @@ def main():
     config = OmegaConf.load(config_path)
     bpe_model_path = os.path.join(config.train.finetune_model_dir, config.dataset.bpe_model)
 
-    # 使用新的多说话人数据加载函数，传递BPE路径而不是对象
+    # 使用新的多說話人資料載入函式，傳遞BPE路徑而不是物件
     train_ds, valid_ds = load_finetune_datasets(config, bpe_model_path) 
     train_ds = DataLoader(train_ds, batch_size=16, shuffle=True, collate_fn=collate_finetune_fn, num_workers=4)
     valid_ds = DataLoader(valid_ds, batch_size=8, shuffle=False, collate_fn=collate_finetune_fn, num_workers=2)

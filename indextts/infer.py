@@ -1,4 +1,4 @@
-import json  # 添加这行
+import json  # 新增這行
 import os
 import sys
 import time
@@ -38,7 +38,7 @@ def set_seed(seed):
 class IndexTTS:
     def __init__(
         self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", is_fp16=True, device=None, use_cuda_kernel=None,
-        speaker_info_path=None,  # 新增：说话人信息文件路径
+        speaker_info_path=None,  # 新增：說話人資訊檔案路徑
     ):
         """
         Args:
@@ -100,7 +100,7 @@ class IndexTTS:
                 use_deepspeed = True
             except (ImportError, OSError, CalledProcessError) as e:
                 use_deepspeed = False
-                print(f">> DeepSpeed加载失败，回退到标准推理: {e}")
+                print(f">> DeepSpeed載入失敗，回退到標準推理: {e}")
                 print("See more details https://www.deepspeed.ai/tutorials/advanced-install/")
 
             self.gpt.post_init_gpt2_config(use_deepspeed=use_deepspeed, kv_cache=True, half=True)
@@ -137,20 +137,20 @@ class IndexTTS:
         print(">> TextNormalizer loaded")
         self.tokenizer = TextTokenizer(self.bpe_path, self.normalizer)
         print(">> bpe model loaded from:", self.bpe_path)
-        # 缓存参考音频mel：
+        # 快取參考音訊mel：
         self.cache_audio_prompt = None
         self.cache_cond_mel = None
-        # 进度引用显示（可选）
+        # 進度引用顯示（可選）
         self.gr_progress = None
         self.model_version = self.cfg.version if hasattr(self.cfg, "version") else None
         
-        # 初始化多说话人支持
+        # 初始化多說話人支援
         self.speaker_list = []
         if speaker_info_path and os.path.exists(speaker_info_path):
             try:
                 with open(speaker_info_path, 'r', encoding='utf-8') as f:
                     speaker_info = json.load(f)
-                # speaker_info.json 是一个数组，每个元素包含 speaker 字段
+                # speaker_info.json 是一個數組，每個元素包含 speaker 欄位
                 self.speaker_list = [item['speaker'] for item in speaker_info if 'speaker' in item]
                 print(f">> Multi-speaker support enabled with {len(self.speaker_list)} speakers: {self.speaker_list}")
             except Exception as e:
@@ -274,7 +274,7 @@ class IndexTTS:
 
     def pad_tokens_cat(self, tokens: List[torch.Tensor]) -> torch.Tensor:
         if self.model_version and self.model_version >= 1.5:
-            # 1.5版本以上，直接使用stop_text_token 右侧填充，填充到最大长度
+            # 1.5版本以上，直接使用stop_text_token 右側填充，填充到最大長度
             # [1, N] -> [N,]
             tokens = [t.squeeze(0) for t in tokens]
             return pad_sequence(tokens, batch_first=True, padding_value=self.cfg.gpt.stop_text_token, padding_side="right")
@@ -304,16 +304,16 @@ class IndexTTS:
         if self.gr_progress is not None:
             self.gr_progress(value, desc=desc)
 
-    # 快速推理：对于“多句长文本”，可实现至少 2~10 倍以上的速度提升~ （First modified by sunnyboxs 2025-04-16）
+    # 快速推理：對於“多句長文字”，可實現至少 2~10 倍以上的速度提升~ （First modified by sunnyboxs 2025-04-16）
     def infer_fast(self, audio_prompt, text, output_path, verbose=False, max_text_tokens_per_sentence=100, sentences_bucket_max_size=4, **generation_kwargs):
         """
         Args:
-            ``max_text_tokens_per_sentence``: 分句的最大token数，默认``100``，可以根据GPU硬件情况调整
-                - 越小，batch 越多，推理速度越*快*，占用内存更多，可能影响质量
-                - 越大，batch 越少，推理速度越*慢*，占用内存和质量更接近于非快速推理
-            ``sentences_bucket_max_size``: 分句分桶的最大容量，默认``4``，可以根据GPU内存调整
-                - 越大，bucket数量越少，batch越多，推理速度越*快*，占用内存更多，可能影响质量
-                - 越小，bucket数量越多，batch越少，推理速度越*慢*，占用内存和质量更接近于非快速推理
+            ``max_text_tokens_per_sentence``: 分句的最大token數，預設``100``，可以根據GPU硬體情況調整
+                - 越小，batch 越多，推理速度越*快*，佔用記憶體更多，可能影響質量
+                - 越大，batch 越少，推理速度越*慢*，佔用記憶體和質量更接近於非快速推理
+            ``sentences_bucket_max_size``: 分句分桶的最大容量，預設``4``，可以根據GPU記憶體調整
+                - 越大，bucket數量越少，batch越多，推理速度越*快*，佔用記憶體更多，可能影響質量
+                - 越小，bucket數量越多，batch越少，推理速度越*慢*，佔用記憶體和質量更接近於非快速推理
         """
         print(">> start fast inference...")
         
@@ -322,7 +322,7 @@ class IndexTTS:
             print(f"origin text:{text}")
         start_time = time.perf_counter()
 
-        # 如果参考音频改变了，才需要重新生成 cond_mel, 提升速度
+        # 如果參考音訊改變了，才需要重新生成 cond_mel, 提升速度
         if self.cache_cond_mel is None or self.cache_audio_prompt != audio_prompt:
             audio, sr = torchaudio.load(audio_prompt)
             audio = torch.mean(audio, dim=0, keepdim=True)
@@ -493,7 +493,7 @@ class IndexTTS:
             wavs.append(wav.cpu()) # to cpu before saving
 
         # clear cache
-        tqdm_progress.close()  # 确保进度条被关闭
+        tqdm_progress.close()  # 確保進度條被關閉
         del all_latents, chunk_latents
         end_time = time.perf_counter()
         self.torch_empty_cache()
@@ -515,7 +515,7 @@ class IndexTTS:
         # save audio
         wav = wav.cpu()  # to cpu
         if output_path:
-            # 直接保存音频到指定路径中
+            # 直接儲存音訊到指定路徑中
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             torchaudio.save(output_path, wav.type(torch.int16), sampling_rate)
             print(">> wav file saved to:", output_path)
@@ -528,7 +528,7 @@ class IndexTTS:
 
     # 原始推理模式
     def infer(self, audio_prompt, text, output_path, verbose=False, max_text_tokens_per_sentence=120, speaker_id=None, **generation_kwargs):
-        # 验证speaker_id
+        # 驗證speaker_id
         if speaker_id is not None:
             if not hasattr(self, 'speaker_list') or not self.speaker_list:
                 raise ValueError("Multi-speaker support not enabled. Please initialize with speaker_info_path.")
@@ -541,7 +541,7 @@ class IndexTTS:
                 print(f"using speaker: {speaker_id}")
         start_time = time.perf_counter()
 
-        # 如果参考音频改变了，才需要重新生成 cond_mel, 提升速度
+        # 如果參考音訊改變了，才需要重新生成 cond_mel, 提升速度
         if self.cache_cond_mel is None or self.cache_audio_prompt != audio_prompt:
             audio, sr = torchaudio.load(audio_prompt)
             audio = torch.mean(audio, dim=0, keepdim=True)
@@ -610,7 +610,7 @@ class IndexTTS:
                     codes = self.gpt.inference_speech(auto_conditioning, text_tokens,
                                                         cond_mel_lengths=torch.tensor([auto_conditioning.shape[-1]],
                                                                                       device=text_tokens.device),
-                                                        speaker_ids=[speaker_id] if speaker_id else None,  # 添加这行
+                                                        speaker_ids=[speaker_id] if speaker_id else None,  # 新增這行
                                                         do_sample=do_sample,
                                                         top_p=top_p,
                                                         top_k=top_k,
@@ -619,7 +619,7 @@ class IndexTTS:
                                                         length_penalty=length_penalty,
                                                         num_beams=num_beams,
                                                         repetition_penalty=repetition_penalty,
-                                                        # 移除 speaker_id=speaker_id 这一行
+                                                        # 移除 speaker_id=speaker_id 這一行
                                                         )
                 gpt_gen_time += time.perf_counter() - m_start_time
                 if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
@@ -685,7 +685,7 @@ class IndexTTS:
         # save audio
         wav = wav.cpu()  # to cpu
         if output_path:
-            # 直接保存音频到指定路径中
+            # 直接儲存音訊到指定路徑中
             if os.path.isfile(output_path):
                 os.remove(output_path)
                 print(">> remove old wav file:", output_path)
@@ -704,7 +704,7 @@ class IndexTTS:
 if __name__ == "__main__":
     set_seed(1234)
     
-    # 指定说话人信息文件
+    # 指定說話人資訊檔案
     speaker_info_path = "finetune_data/processed_data/speaker_info.json"
 
     ifile = sys.argv[1]
@@ -715,13 +715,13 @@ if __name__ == "__main__":
             uid, prompt_txt, prompt_wav, target_txt = line.split('|')
             target_txt_list.append((uid, target_txt))
     
-    # 初始化TTS，加载多说话人支持
+    # 初始化TTS，載入多說話人支援
     tts = IndexTTS(
         cfg_path="checkpoints/config.yaml", 
         model_dir="checkpoints", 
         is_fp16=True, 
         use_cuda_kernel=False,
-        speaker_info_path=speaker_info_path  # 新增参数
+        speaker_info_path=speaker_info_path  # 新增引數
     )
 
     prompts = [
@@ -733,7 +733,7 @@ if __name__ == "__main__":
         output_dir = f"result/{speaker_id}_{os.path.basename(ifile).rstrip('.lst')}_{time.strftime('%Y%m%d_%H%M%S')}"
         os.makedirs(output_dir, exist_ok=True)
 
-        # 使用不同说话人进行推理
+        # 使用不同說話人進行推理
         for i, (uid, target_txt) in enumerate(target_txt_list):
 
             output_wav_path = f"{output_dir}/{uid}.wav"
@@ -742,5 +742,5 @@ if __name__ == "__main__":
                 text=target_txt, 
                 output_path=output_wav_path, 
                 verbose=True,
-                speaker_id=speaker_id  # 新增参数
+                speaker_id=speaker_id  # 新增引數
             )

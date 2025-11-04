@@ -47,9 +47,10 @@ setup(
     install_requires=[
         "torch>=2.1.2",
         "torchaudio",
-        "transformers==4.36.2",
+        "transformers==4.44.2",  # 升級以支援 peft 0.13.2
+        "peft==0.13.2",  # 兼容訓練和推理的版本
         "accelerate",
-        "tokenizers==0.15.0",
+        "tokenizers>=0.15.0",  # 放寬版本限制
         "einops==0.8.1",
         "matplotlib==3.8.2",
         "omegaconf",

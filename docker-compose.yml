@@ -1,0 +1,42 @@
+services:
+  index-tts-lora:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: index-tts-lora:latest
+    container_name: index-tts-lora
+
+    # GPU 支援
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # 環境變數
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=0
+
+    # 使用當前用戶運行 (避免 root 權限問題)
+    # user: "${UID}:${GID}"  # 取消註解以使用
+
+    # 端口映射
+    ports:
+      - "7860:7860"
+
+    # 掛載卷 - 掛載整個專案目錄
+    volumes:
+      - .:/workspace/index-tts-lora
+
+    working_dir: /workspace/index-tts-lora
+
+    # 共享內存大小
+    shm_size: '16gb'
+
+    # 默認啟動 WebUI (entrypoint.sh 會先檢查模型)
+    command: python3 webui.py --host 0.0.0.0 --port 7860
+
+    restart: unless-stopped

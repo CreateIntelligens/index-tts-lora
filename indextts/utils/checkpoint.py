@@ -23,36 +23,36 @@ from loguru import logger
 def load_checkpoint(model: torch.nn.Module, model_pth: str) -> dict:
     checkpoint = torch.load(model_pth, map_location='cpu', weights_only=False)
     
-    # 获取模型设备
+    # 獲取模型裝置
     device = next(model.parameters()).device
     
-    # 处理多说话人的 speaker_conditions（在checkpoint顶层）
+    # 處理多說話人的 speaker_conditions（在checkpoint頂層）
     if 'speaker_conditions' in checkpoint:
         logger.info(f"Loading multi-speaker conditions from checkpoint")
         speaker_conditions = checkpoint['speaker_conditions']
         
         for speaker_id, condition_array in speaker_conditions.items():
-            # 转换为tensor并移动到正确设备
+            # 轉換為tensor並移動到正確裝置
             condition_tensor = torch.from_numpy(condition_array).float().to(device)
             
-            # 确保维度正确 (1, 32, dim)
+            # 確保維度正確 (1, 32, dim)
             if condition_tensor.dim() == 2:
                 condition_tensor = condition_tensor.unsqueeze(0)
             
-            # 注册为模型参数
+            # 註冊為模型引數
             param_name = f"mean_condition_{speaker_id}"
             setattr(model, param_name, torch.nn.Parameter(condition_tensor))
             logger.info(f"Loaded speaker {speaker_id} condition: {condition_tensor.shape}")
     
-    # 获取model部分进行加载
+    # 獲取model部分進行載入
     model_state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
     
-    # 处理单一的 mean_condition（向后兼容，在model_state_dict中）
+    # 處理單一的 mean_condition（向後相容，在model_state_dict中）
     if 'mean_condition' in model_state_dict and hasattr(model, 'mean_condition'):
         logger.info(f"Loading single mean_condition: checkpoint device={model_state_dict['mean_condition'].device}, target device={device}")
         model.mean_condition = model_state_dict['mean_condition'].to(device)
         logger.info(f"After loading: mean_condition device={model.mean_condition.device}")
-        # 从model_state_dict中移除，避免在load_state_dict时冲突
+        # 從model_state_dict中移除，避免在load_state_dict時衝突
         model_state_dict = {k: v for k, v in model_state_dict.items() if k != 'mean_condition'}
     
     model.load_state_dict(model_state_dict, strict=False)
@@ -63,7 +63,7 @@ def load_checkpoint(model: torch.nn.Module, model_pth: str) -> dict:
         with open(info_path, 'r') as fin:
             configs = yaml.load(fin, Loader=yaml.FullLoader)
     
-    # 返回说话人列表信息（如果存在，在checkpoint顶层）
+    # 返回說話人列表資訊（如果存在，在checkpoint頂層）
     if 'speakers' in checkpoint:
         configs['speakers'] = checkpoint['speakers']
     

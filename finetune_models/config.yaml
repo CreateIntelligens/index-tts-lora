@@ -108,22 +108,22 @@ bigvgan:
         world_size: 1
 
 train:
-    finetune_model_dir: "finetune_models" # 微调模型根目录
+    finetune_model_dir: "finetune_models" # 微調模型根目錄
     seed: 91
     epochs: 15
-    # batch_size 在此脚本中固定为 1
+    # batch_size 在此指令碼中固定為 1
     gradient_accumulation_steps: 4
     max_grad_norm: 1.0
     text_weight: 0.1
     early_stopping_patience: 1
-    max_steps_per_epoch: 150 # 每个 epoch 最大训练样本数
+    max_steps_per_epoch: 150 # 每個 epoch 最大訓練樣本數
     data_path: "finetune_data/processed_data"
 
     optimizer:
         learning_rate: 5.0e-5
         weight_decay: 0.01
-        warmup_ratio: 0.1 # 预热步数占总步数的比例
-        loraplus_lr_ratio: 8.0 # LoRA+ B矩阵的学习率倍数
+        warmup_ratio: 0.1 # 預熱步數佔總步數的比例
+        loraplus_lr_ratio: 8.0 # LoRA+ B矩陣的學習率倍數
 
     lora:
         r: 16
