@@ -55,6 +55,7 @@ show_help() {
     echo -e "${BOLD}使用方式:${NC}"
     echo -e "  ./run.sh <命令> [選項]\n"
     echo -e "${BOLD}可用命令:${NC}"
+    echo -e "  ${GREEN}download${NC}                下載模型檔案"
     echo -e "  ${GREEN}pipeline${NC} <data_dir>     執行完整訓練流程"
     echo -e "  ${GREEN}prepare${NC} <data_dir>      準備音頻列表"
     echo -e "  ${GREEN}extract${NC}                 提取音頻特徵"
@@ -179,6 +180,28 @@ PY
         echo "   - $list" >&2
     done
     exit 1
+}
+
+# 下載模型
+download_models() {
+    print_header "下載模型"
+
+    if [ -f "download_models.sh" ]; then
+        print_info "執行 download_models.sh..."
+        bash download_models.sh
+
+        # 建立軟連結
+        if [ -f "checkpoints/gpt.pth" ] && [ ! -e "checkpoints/gpt.pth.open_source" ]; then
+            print_info "建立 gpt.pth.open_source 軟連結..."
+            ln -s gpt.pth checkpoints/gpt.pth.open_source
+            print_success "軟連結建立完成"
+        fi
+
+        print_success "模型下載完成！"
+    else
+        print_error "找不到 download_models.sh 腳本"
+        exit 1
+    fi
 }
 
 # 準備音頻列表 (單說話人或多說話人)
@@ -453,6 +476,9 @@ main() {
     case "$command" in
         pipeline)
             full_pipeline "$@"
+            ;;
+        download)
+            download_models
             ;;
         prepare)
             prepare_audio_list "$@"

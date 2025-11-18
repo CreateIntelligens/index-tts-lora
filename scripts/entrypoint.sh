@@ -99,6 +99,13 @@ else
     echo "✨ 所有模型文件已存在!"
 fi
 
+# 建立 gpt.pth.open_source 軟連結 (如果不存在)
+if [ -f "$CHECKPOINT_DIR/gpt.pth" ] && [ ! -e "$CHECKPOINT_DIR/gpt.pth.open_source" ]; then
+    echo "🔗 建立 gpt.pth.open_source 軟連結..."
+    ln -s gpt.pth "$CHECKPOINT_DIR/gpt.pth.open_source"
+    echo "✅ 軟連結建立完成"
+fi
+
 echo ""
 echo "📦 安裝 indextts 套件..."
 
