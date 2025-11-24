@@ -48,6 +48,77 @@ tts = IndexTTS(model_dir=cmd_args.model_dir, cfg_path=os.path.join(cmd_args.mode
 os.makedirs("outputs/tasks",exist_ok=True)
 os.makedirs("prompts",exist_ok=True)
 
+# 掃描可用的 GPT 模型
+def get_available_models():
+    """掃描並返回所有可用的 GPT 模型"""
+    models = {}
+
+    # 1. 預設模型（checkpoints/gpt.pth）
+    default_model = os.path.join(cmd_args.model_dir, "gpt.pth")
+    if os.path.exists(default_model):
+        models["預設模型 (gpt.pth)"] = default_model
+
+    # 2. 訓練的模型（finetune_models/checkpoints/*.pth）
+    finetune_dir = "finetune_models/checkpoints"
+    if os.path.exists(finetune_dir):
+        pth_files = sorted([f for f in os.listdir(finetune_dir) if f.endswith('.pth')])
+        for pth_file in pth_files:
+            display_name = f"訓練模型 - {pth_file}"
+            full_path = os.path.join(finetune_dir, pth_file)
+            models[display_name] = full_path
+
+    return models
+
+def reload_gpt_model(model_path, progress=gr.Progress()):
+    """重新載入 GPT 模型"""
+    global tts
+    try:
+        progress(0, desc="正在載入模型...")
+
+        # 載入新模型
+        from indextts.gpt.model import UnifiedVoice
+        from indextts.utils.checkpoint import load_checkpoint
+        import torch
+
+        # 創建新的 GPT 模型實例
+        new_gpt = UnifiedVoice(**tts.cfg.gpt)
+
+        progress(0.3, desc="載入模型權重...")
+        load_checkpoint(new_gpt, model_path)
+
+        progress(0.6, desc="配置模型...")
+        new_gpt = new_gpt.to(tts.device)
+        if tts.is_fp16:
+            new_gpt.eval().half()
+            try:
+                import deepspeed
+                use_deepspeed = True
+            except:
+                use_deepspeed = False
+            new_gpt.post_init_gpt2_config(use_deepspeed=use_deepspeed, kv_cache=True, half=True)
+        else:
+            new_gpt.eval()
+            new_gpt.post_init_gpt2_config(use_deepspeed=False, kv_cache=True, half=False)
+
+        progress(0.9, desc="替換模型...")
+        # 替換舊模型
+        del tts.gpt
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        tts.gpt = new_gpt
+        tts.gpt_path = model_path
+
+        progress(1.0, desc="完成！")
+        return f"✅ 成功載入模型: {os.path.basename(model_path)}"
+
+    except Exception as e:
+        return f"❌ 載入模型失敗: {str(e)}"
+
+available_models = get_available_models()
+
 with open("tests/cases.jsonl", "r", encoding="utf-8") as f:
     example_cases = []
     for line in f:
@@ -104,6 +175,38 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
 <a href='https://arxiv.org/abs/2502.05512'><img src='https://img.shields.io/badge/ArXiv-2502.05512-red'></a>
 </p>
     ''')
+
+    # 模型選擇區域
+    with gr.Accordion("🎯 模型選擇", open=True):
+        with gr.Row():
+            model_choices = list(available_models.keys())
+            default_choice = model_choices[0] if model_choices else None
+
+            model_dropdown = gr.Dropdown(
+                choices=model_choices,
+                value=default_choice,
+                label="選擇 GPT 模型",
+                info=f"當前已載入: {os.path.basename(tts.gpt_path)}"
+            )
+
+            reload_button = gr.Button("🔄 載入模型", variant="primary")
+
+        model_status = gr.Textbox(label="狀態", interactive=False, value=f"✅ 當前模型: {os.path.basename(tts.gpt_path)}")
+
+        # 綁定載入按鈕
+        def on_reload_model(selected_model, progress=gr.Progress()):
+            if selected_model not in available_models:
+                return "❌ 無效的模型選擇"
+            model_path = available_models[selected_model]
+            result = reload_gpt_model(model_path, progress)
+            return result
+
+        reload_button.click(
+            on_reload_model,
+            inputs=[model_dropdown],
+            outputs=[model_status]
+        )
+
     with gr.Tab("音訊生成"):
         with gr.Row():
             os.makedirs("prompts",exist_ok=True)

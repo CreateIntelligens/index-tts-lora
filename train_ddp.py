@@ -58,15 +58,18 @@ from train import (
     load_UnifiedVoice,
     clear_torch_cache,
     forward_gpt2,
-    forward_fn,
+    forward_UnifiedVoice,
     top_k_accuracy,
 )
 
 
 def setup_ddp(rank: int, world_size: int):
     """初始化 DDP 環境"""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
+    # 設定預設值（如果 torchrun 沒有設定）
+    if 'MASTER_ADDR' not in os.environ:
+        os.environ['MASTER_ADDR'] = 'localhost'
+    if 'MASTER_PORT' not in os.environ:
+        os.environ['MASTER_PORT'] = '12355'
 
     # 初始化進程組
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
@@ -119,10 +122,9 @@ class DDPTrainer:
         # 載入模型和分詞器
         self._load_models()
 
-        # 設定最佳化器和排程器
-        self._setup_optimizer_and_scheduler()
-
-        # 初始化訓練狀態
+        # 初始化訓練狀態（optimizer 會在 train() 裡設定）
+        self.optimizer = None
+        self.scheduler = None
         self.best_val_loss = (0, float('inf'), float('inf'))
         self.update_steps = 0
 
@@ -196,7 +198,7 @@ class DDPTrainer:
         model.inference_model = get_peft_model(model.inference_model, gpt_lora_config)
         return model
 
-    def _setup_optimizer_and_scheduler(self, num_training_steps: int = 1000):
+    def _setup_optimizer_and_scheduler(self, num_training_steps: int = 0):
         """設定最佳化器和排程器"""
         opt_cfg = self.config.train.optimizer
         self.optimizer = create_loraplus_optimizer(
@@ -208,15 +210,24 @@ class DDPTrainer:
             weight_decay=opt_cfg.weight_decay,
         )
 
+        warmup_steps = opt_cfg.get("warmup_steps", None)
+        if warmup_steps is None:
+            warmup_ratio = opt_cfg.get("warmup_ratio", 0.0)
+            if warmup_ratio > 0 and num_training_steps > 0:
+                warmup_steps = max(1, int(num_training_steps * warmup_ratio))
+            else:
+                warmup_steps = 0
+
         self.scheduler = get_cosine_schedule_with_warmup(
             self.optimizer,
-            num_warmup_steps=opt_cfg.warmup_steps,
-            num_training_steps=num_training_steps,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=max(num_training_steps, warmup_steps + 1),
         )
 
-    def train(self, train_ds: Dataset, valid_ds: Dataset):
+    def train(self, train_ds: Dataset, valid_ds: Dataset, resume_checkpoint: str = None):
         """訓練流程"""
         train_cfg = self.config.train
+        start_epoch = 0
 
         # 使用 DistributedSampler
         train_sampler = DistributedSampler(
@@ -226,20 +237,59 @@ class DDPTrainer:
             shuffle=True
         )
 
-        # 計算訓練步數（注意：DDP 下每個進程看到的資料量是總量的 1/world_size）
-        samples_per_epoch = len(train_ds) // self.world_size
-        total_update_steps = samples_per_epoch * train_cfg.epochs
+        train_batch_size = train_cfg.get("batch_size", 1)
+        train_num_workers = train_cfg.get("num_workers", 2)
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=train_batch_size,
+            sampler=train_sampler,
+            collate_fn=collate_finetune_fn,
+            num_workers=train_num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+
+        valid_batch_size = train_cfg.get("valid_batch_size", 4)
+        valid_num_workers = train_cfg.get("valid_num_workers", 2)
+        valid_loader = DataLoader(
+            valid_ds,
+            batch_size=valid_batch_size,
+            shuffle=False,
+            collate_fn=collate_finetune_fn,
+            num_workers=valid_num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+
+        steps_per_epoch = len(train_loader)
+        total_update_steps = steps_per_epoch * train_cfg.epochs
+
+        # 先創建 optimizer 和 scheduler
         self._setup_optimizer_and_scheduler(num_training_steps=total_update_steps)
 
+        # 如果有 checkpoint，在創建 optimizer 後載入狀態
+        if resume_checkpoint:
+            loaded_epoch = self._load_checkpoint_states(resume_checkpoint)
+            if loaded_epoch > 0:
+                start_epoch = loaded_epoch
+                # 重新計算剩餘步數並更新 scheduler
+                remaining_epochs = train_cfg.epochs - start_epoch
+                remaining_steps = steps_per_epoch * remaining_epochs
+                if self.is_main_process:
+                    logger.info(f"Remaining training steps: {remaining_steps}")
+
         if self.is_main_process:
-            logger.info(f"Starting DDP training for {train_cfg.epochs} epochs")
-            logger.info(f"Samples per epoch (per GPU): {samples_per_epoch}")
+            if start_epoch > 0:
+                logger.info(f"🔄 Resuming DDP training from epoch {start_epoch + 1}")
+            else:
+                logger.info(f"Starting DDP training for {train_cfg.epochs} epochs")
+            logger.info(f"Steps per epoch (per GPU): {steps_per_epoch}")
             logger.info(f"Total samples: {len(train_ds)}")
             logger.info(f"Total update steps (per GPU): {total_update_steps}")
 
         text_weight = train_cfg.text_weight
 
-        for epoch in range(train_cfg.epochs):
+        for epoch in range(start_epoch, train_cfg.epochs):
             # 設定 epoch 以確保 shuffle 正確
             train_sampler.set_epoch(epoch)
 
@@ -250,7 +300,7 @@ class DDPTrainer:
 
             self.model.train()
 
-            for batch_idx, batch in enumerate(train_ds):
+            for batch_idx, batch in enumerate(train_loader):
                 # 將資料移到對應的 GPU
                 data_batch = []
                 for item in batch:
@@ -281,7 +331,7 @@ class DDPTrainer:
                 if self.is_main_process and batch_idx % 10 == 0:  # 每 10 batch 打印一次
                     logger.info(
                         f"[GPU 0/{self.world_size}] Epoch {epoch + 1}/{train_cfg.epochs} | "
-                        f"Batch {batch_idx}/{len(train_ds)} | "
+                        f"Batch {batch_idx}/{steps_per_epoch} | "
                         f"text_loss={loss_text.item():.4f}, mel_loss={loss_mel.item():.4f}, "
                         f"acc@1={acc_1:.2f}%, acc@10={acc_10:.2f}%, acc@20={acc_20:.2f}%, "
                         f"grad_norm={grad_norm.item():.2f}"
@@ -289,7 +339,7 @@ class DDPTrainer:
 
             # 驗證（只在主進程）
             if self.is_main_process:
-                val_text_loss, val_mel_loss, _, _, _ = self._validate_epoch(valid_ds, epoch)
+                val_text_loss, val_mel_loss, _, _, _ = self._validate_epoch(valid_loader, epoch)
                 self._save_checkpoint(epoch, val_text_loss, val_mel_loss)
 
             # 同步所有進程
@@ -297,27 +347,23 @@ class DDPTrainer:
 
     def _train_step(self, batch: Tuple) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """單個訓練步驟"""
-        # 解包 batch（與原始 Trainer 相同）
-        text_ids, text_lengths, mel_spec, mel_lengths, mel_codes, codes_lengths, speaker_ids = batch
-
-        # 使用說話人條件
+        # 解包 batch
+        mel_spec, mel_codes, text_ids, conditions, speaker_ids, mel_lengths, codes_lengths, text_lengths = batch
         batch_speaker_ids = list(speaker_ids)
-        speaker_means = [self.speaker_mean_conditions[sid] for sid in batch_speaker_ids]
-        speaker_means = torch.cat(speaker_means, dim=0)
 
         # 前向傳播
-        outputs = forward_fn(
+        outputs = forward_UnifiedVoice(
             self.model.module,  # DDP 需要使用 .module
-            text_ids,
-            text_lengths,
             mel_spec,
-            mel_lengths,
             mel_codes,
+            text_ids,
+            mel_lengths,
             codes_lengths,
+            text_lengths,
             speaker_ids=batch_speaker_ids,
+            add_mel_stop_token=self.config.train.get('add_mel_stop_token', True),
             output_loss=True,
-            output_logits=False,
-            add_mel_stop_token=self.config.train.add_mel_stop_token,
+            output_logits=True,
         )
 
         loss_text, loss_mel = outputs["loss"]
@@ -353,8 +399,52 @@ class DDPTrainer:
 
         return avg_text_loss, avg_mel_loss, 0.0, 0.0, 0.0
 
+    def _load_checkpoint_states(self, checkpoint_path: str) -> int:
+        """
+        從 checkpoint 恢復訓練
+
+        Args:
+            checkpoint_path: checkpoint 檔案路徑
+
+        Returns:
+            start_epoch: 要從哪個 epoch 開始繼續訓練
+        """
+        if not os.path.exists(checkpoint_path):
+            if self.is_main_process:
+                logger.error(f"❌ Checkpoint not found: {checkpoint_path}")
+            return 0
+
+        if self.is_main_process:
+            logger.info(f"📂 Loading checkpoint from: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+        # 載入模型權重
+        self.model.module.load_state_dict(checkpoint['model_state_dict'])
+        if self.is_main_process:
+            logger.info("✓ Model state loaded")
+
+        # 載入 optimizer 和 scheduler（如果已經初始化）
+        if hasattr(self, 'optimizer') and self.optimizer is not None:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if self.is_main_process:
+                logger.info("✓ Optimizer state loaded")
+
+        if hasattr(self, 'scheduler') and self.scheduler is not None:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            if self.is_main_process:
+                logger.info("✓ Scheduler state loaded")
+
+        start_epoch = checkpoint['epoch'] + 1  # 從下一個 epoch 開始
+        if self.is_main_process:
+            logger.info(f"✓ Resuming from epoch {start_epoch}")
+            logger.info(f"   Last val_text_loss: {checkpoint.get('val_text_loss', 'N/A'):.4f}")
+            logger.info(f"   Last val_mel_loss: {checkpoint.get('val_mel_loss', 'N/A'):.4f}")
+
+        return start_epoch
+
     def _save_checkpoint(self, epoch: int, val_text_loss: float, val_mel_loss: float):
         """儲存 checkpoint（只在主進程）"""
+        # 1. 先儲存訓練用的 checkpoint（包含 optimizer 等，用於恢復訓練）
         checkpoint_path = os.path.join(self.checkpoint_dir, f"checkpoint_epoch_{epoch + 1}.pt")
         torch.save({
             'epoch': epoch,
@@ -364,11 +454,52 @@ class DDPTrainer:
             'val_text_loss': val_text_loss,
             'val_mel_loss': val_mel_loss,
         }, checkpoint_path)
-        logger.info(f"💾 Checkpoint saved: {checkpoint_path}")
+        logger.info(f"💾 Training checkpoint saved: {checkpoint_path}")
+
+        # 2. 儲存合併後的模型（用於推理）
+        merged_model_path = os.path.join(self.checkpoint_dir, f"gpt_epoch_{epoch + 1}.pth")
+        logger.info("🔄 Merging LoRA weights for inference model...")
+
+        # 獲取實際模型（DDP wrapper）
+        actual_model = self.model.module
+
+        # 建立深複製以避免影響繼續訓練
+        import copy
+        logger.info("Creating a deep copy of the model for merge...")
+        model_to_save = copy.deepcopy(actual_model)
+
+        # 在深複製上進行 LoRA 融合與解除安裝
+        fused_inference_model = model_to_save.inference_model.merge_and_unload()
+        model_to_save.inference_model = fused_inference_model
+        logger.info("✓ LoRA weights merged and unloaded")
+
+        # 儲存完整模型（格式與 train.py 一致）
+        state_dict = model_to_save.state_dict()
+        checkpoint_data = {
+            'model': state_dict,
+            'speakers': self.speaker_list,
+            'speaker_conditions': {speaker_id: param.detach().cpu().numpy()
+                                 for speaker_id, param in self.speaker_mean_conditions.items()}
+        }
+
+        torch.save(checkpoint_data, merged_model_path)
+        logger.info(f"💾 Merged model saved: {merged_model_path}")
+        logger.info(f"   Saved conditions for speakers: {self.speaker_list}")
+
+        # 清理深複製
+        del model_to_save
+        torch.cuda.empty_cache()
+        logger.info("✓ Cleaned up temporary merged model")
 
 
 def main():
     """主函數"""
+    import argparse
+    parser = argparse.ArgumentParser(description='DDP Training with resume support')
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Path to checkpoint to resume from (e.g., finetune_models/checkpoints/checkpoint_epoch_5.pt)')
+    args = parser.parse_args()
+
     # 獲取 DDP 環境變數
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ['RANK'])
@@ -377,6 +508,7 @@ def main():
     else:
         print("❌ 請使用 torch.distributed.launch 或 torchrun 啟動此腳本")
         print("範例: torchrun --nproc_per_node=8 train_ddp.py")
+        print("恢復訓練: torchrun --nproc_per_node=8 train_ddp.py --resume finetune_models/checkpoints/checkpoint_epoch_5.pt")
         return
 
     # 初始化 DDP
@@ -384,16 +516,20 @@ def main():
 
     try:
         # 載入配置
-        config = OmegaConf.load("config.yaml")
+        config = OmegaConf.load("finetune_models/config.yaml")
 
         # 創建訓練器
         trainer = DDPTrainer(config, local_rank, world_size)
 
         # 載入資料集
-        train_ds, valid_ds = load_finetune_datasets(config)
+        bpe_model_path = os.path.join(
+            config.train.finetune_model_dir,
+            config.dataset.bpe_model
+        )
+        train_ds, valid_ds = load_finetune_datasets(config, bpe_model_path)
 
-        # 開始訓練
-        trainer.train(train_ds, valid_ds)
+        # 開始訓練（resume_checkpoint 會在 train() 內部處理）
+        trainer.train(train_ds, valid_ds, resume_checkpoint=args.resume)
 
     finally:
         # 清理

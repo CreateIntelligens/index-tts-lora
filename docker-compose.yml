@@ -18,7 +18,7 @@ services:
     # 環境變數
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-      - CUDA_VISIBLE_DEVICES=0
+      - CUDA_VISIBLE_DEVICES=4,5,6,7
 
     # 使用當前用戶運行 (避免 root 權限問題)
     # user: "${UID}:${GID}"  # 取消註解以使用
@@ -30,6 +30,8 @@ services:
     # 掛載卷 - 掛載整個專案目錄
     volumes:
       - .:/workspace/index-tts-lora
+      # for p4
+      - /mnt/data/output1119:/workspace/index-tts-lora/data
 
     working_dir: /workspace/index-tts-lora
 

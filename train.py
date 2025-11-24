@@ -49,7 +49,7 @@ def load_UnifiedVoice(gpt_config: DictConfig, gpt_checkpoint_path: str, device: 
 def clear_torch_cache():
     """清理 GPU 快取。"""
     if torch.cuda.is_available():
-        logger.info("Clearing CUDA cache...")
+        # logger.info("Clearing CUDA cache...")
         # logger.info(f"{torch.cuda.memory_reserved() / (1024**2):.2f} MiB reserved")
         gc.collect()
         torch.cuda.synchronize()
@@ -69,19 +69,22 @@ def forward_gpt2(
     assert attention_mask is not None, "Attention mask must be provided for UnifiedVoice forward pass."
 
     """UnifiedVoice GPT2 部分的前向傳播。"""
+    # 處理 DataParallel 包裝：取得實際的模型
+    actual_model = model.module if isinstance(model, nn.DataParallel) else model
+
     b = inputs_embeds.shape[0]
-    gpt_out = model.gpt(inputs_embeds=inputs_embeds, attention_mask=attention_mask, return_dict=True)
+    gpt_out = actual_model.gpt(inputs_embeds=inputs_embeds, attention_mask=attention_mask, return_dict=True)
     hidden_state = gpt_out.last_hidden_state
 
     # Vectorized implementation to replace the for loop
     conditioning_len = 32
-    
+
     # Remove conditioning part from hidden states and attention mask
     h_no_cond = hidden_state[:, conditioning_len:]  # [b, seq_len, hidden_dim]
     attention_no_cond = attention_mask[:, conditioning_len:]  # [b, seq_len]
-    
+
     # Apply final_norm to all samples at once
-    latent = model.final_norm(h_no_cond)  # [b, seq_len, hidden_dim]
+    latent = actual_model.final_norm(h_no_cond)  # [b, seq_len, hidden_dim]
     
     # Get max lengths for efficient processing
     max_text_len = text_lengths.max().item()
@@ -120,11 +123,11 @@ def forward_gpt2(
     
     # Vectorized head processing
     # Process all text latents at once
-    batch_text_logits = model.text_head(batch_text_latents)  # [b, max_text_len, vocab_size]
+    batch_text_logits = actual_model.text_head(batch_text_latents)  # [b, max_text_len, vocab_size]
     batch_text_logits = batch_text_logits.permute(0, 2, 1)  # [b, vocab_size, max_text_len]
-    
-    # Process all mel latents at once  
-    batch_mel_logits = model.mel_head(batch_mel_latents)  # [b, max_mel_len, vocab_size]
+
+    # Process all mel latents at once
+    batch_mel_logits = actual_model.mel_head(batch_mel_latents)  # [b, max_mel_len, vocab_size]
     batch_mel_logits = batch_mel_logits.permute(0, 2, 1)  # [b, vocab_size, max_mel_len]
     
     # Return the processed batches directly.
@@ -153,7 +156,10 @@ def forward_UnifiedVoice(
 ):
     """UnifiedVoice 模型的完整前向傳播。"""
 
-    conditioning_latent = model.get_conditioning(mel_spec, mel_lengths, speaker_ids=speaker_ids)  # 傳遞 speaker_ids
+    # 處理 DataParallel 包裝：取得實際的模型
+    actual_model = model.module if isinstance(model, nn.DataParallel) else model
+
+    conditioning_latent = actual_model.get_conditioning(mel_spec, mel_lengths, speaker_ids=speaker_ids)  # 傳遞 speaker_ids
     
     # -------- build text_inputs with start/stop tokens --------
     B, T_pad = text_ids.shape
@@ -161,9 +167,9 @@ def forward_UnifiedVoice(
     text_inputs = text_ids.new_zeros((B, max_out_text))
     for i, L in enumerate(text_lengths):
         L = L.item()
-        text_inputs[i, 0] = model.start_text_token
+        text_inputs[i, 0] = actual_model.start_text_token
         text_inputs[i, 1 : L + 1] = text_ids[i, :L]
-        text_inputs[i, L + 1] = model.stop_text_token
+        text_inputs[i, L + 1] = actual_model.stop_text_token
     text_targets = text_inputs[:, 1:].clone().contiguous()
 
     # -------- build mel_inputs with start/stop tokens --------
@@ -173,15 +179,15 @@ def forward_UnifiedVoice(
     mel_inputs = mel_codes.new_zeros((B, max_out_mel))
     for i, L in enumerate(codes_lengths):
         L = L.item()
-        mel_inputs[i, 0] = model.start_mel_token
+        mel_inputs[i, 0] = actual_model.start_mel_token
         mel_inputs[i, 1 : L + 1] = mel_codes[i, :L]
         if add_mel_stop_token:
-            mel_inputs[i, L + 1] = model.stop_mel_token
+            mel_inputs[i, L + 1] = actual_model.stop_mel_token
     mel_targets = mel_inputs[:, 1:].clone().contiguous()
 
     # Embeddings
-    text_emb = model.text_embedding(text_inputs) + model.text_pos_embedding(text_inputs)
-    mel_emb = model.mel_embedding(mel_inputs) + model.mel_pos_embedding(mel_inputs)
+    text_emb = actual_model.text_embedding(text_inputs) + actual_model.text_pos_embedding(text_inputs)
+    mel_emb = actual_model.mel_embedding(mel_inputs) + actual_model.mel_pos_embedding(mel_inputs)
 
     # for later use in loss and lengths
     mel_codes = mel_inputs
@@ -312,7 +318,8 @@ class Trainer:
         self.config = config
         self.use_multi_gpu = use_multi_gpu and GPU_MANAGER_AVAILABLE
         self.gpu_manager = None
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # 使用 cuda:0 作為主設備，確保 DataParallel 的主進程在第一張卡
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
         # 初始化 GPU Manager
         if self.use_multi_gpu and torch.cuda.is_available():
@@ -397,8 +404,11 @@ class Trainer:
         # 多 GPU 支援：使用 DataParallel 包裝模型
         if self.use_multi_gpu and self.gpu_manager and self.gpu_manager.get_gpu_count() > 1:
             logger.info("🚀 使用 DataParallel 包裝模型進行多 GPU 訓練")
-            self.model = nn.DataParallel(self.model)
-            logger.info(f"  模型已分散到 {torch.cuda.device_count()} 個 GPU")
+            # 明確指定使用所有可用的 GPU
+            device_ids = list(range(torch.cuda.device_count()))
+            logger.info(f"  使用的 GPU 裝置: {device_ids}")
+            self.model = nn.DataParallel(self.model, device_ids=device_ids)
+            logger.info(f"  模型已分散到 {len(device_ids)} 個 GPU")
 
         # 註冊多說話人的mean_condition作為可學習引數
         self.speaker_mean_conditions = {}
@@ -463,7 +473,9 @@ class Trainer:
     def _train_step(self, data_batch: tuple) -> Tuple[torch.Tensor, torch.Tensor, dict]:  # 修正：應該返回三個值
         """執行單個訓練步驟（前向和後向傳播）。"""
         self.model.train()
-        self.model.inference_model.kv_cache = False  # 訓練時停用 KV 快取
+        # 獲取實際模型（處理 DataParallel 包裝）
+        actual_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        actual_model.inference_model.kv_cache = False  # 訓練時停用 KV 快取
     
         # Unpack data_batch: mel_spec, mel_codes, text_ids, conditions, speaker_ids, mel_lengths, codes_lengths, text_lengths
         mel_spec, mel_codes, text_ids, conditions, speaker_ids, mel_lengths, codes_lengths, text_lengths = data_batch
@@ -567,26 +579,28 @@ class Trainer:
     def _save_checkpoint(self, file_name: str, merge_lora: bool, unload_after_merge: bool):
         """儲存模型檢查點，包含說話人資訊。"""
         checkpoint_path = os.path.join(self.checkpoint_dir, file_name)
-        
+
         self.model.eval()
-        
-        model_to_save = self.model
-        
+
+        # 獲取實際模型（處理 DataParallel 包裝）
+        actual_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        model_to_save = actual_model
+
         if merge_lora:
             logger.info("Merging LoRA weights into the model for saving...")
             if unload_after_merge:
                 # 為了在不影響繼續訓練的情況下儲存完全融合的模型，我們建立一個深複製
                 # 注意：這可能會消耗較多記憶體和時間
                 logger.info("Creating a deep copy of the model for a clean merge. This may take a moment...")
-                model_to_save = copy.deepcopy(self.model)
-                
+                model_to_save = copy.deepcopy(actual_model)
+
                 # 在深複製上進行融合與解除安裝
                 fused_inference_model = model_to_save.inference_model.merge_and_unload()
                 model_to_save.inference_model = fused_inference_model
                 logger.info("LoRA weights merged and unloaded in the copied model.")
             else:
                 # 如果只是臨時融合，直接在原模型上操作，後續再unmerge
-                self.model.inference_model.merge_adapter()
+                actual_model.inference_model.merge_adapter()
     
         # 儲存模型狀態和說話人資訊
         state_dict = model_to_save.state_dict()
@@ -610,8 +624,8 @@ class Trainer:
         # 如果是臨時融合，恢復模型狀態以便繼續訓練
         if merge_lora and not unload_after_merge:
             logger.info("Unmerging LoRA weights to continue training...")
-            self.model.inference_model.unmerge_adapter()
-                
+            actual_model.inference_model.unmerge_adapter()
+
         self.model.train()
 
     def train(self, train_ds: Dataset, valid_ds: Dataset):

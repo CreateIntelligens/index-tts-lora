@@ -274,10 +274,21 @@ class IndexTTS:
 
     def pad_tokens_cat(self, tokens: List[torch.Tensor]) -> torch.Tensor:
         if self.model_version and self.model_version >= 1.5:
-            # 1.5版本以上，直接使用stop_text_token 右側填充，填充到最大長度
+            # 1.5版本以上，使用 stop_text_token 右側填充
             # [1, N] -> [N,]
             tokens = [t.squeeze(0) for t in tokens]
-            return pad_sequence(tokens, batch_first=True, padding_value=self.cfg.gpt.stop_text_token, padding_side="right")
+            # 手動實現 right padding（PyTorch pad_sequence 不支援 padding_side）
+            max_len = max(t.size(0) for t in tokens)
+            outputs = []
+            for t in tokens:
+                pad_len = max_len - t.size(0)
+                if pad_len > 0:
+                    # 在右側填充 stop_text_token
+                    padded = torch.cat([t, torch.full((pad_len,), self.cfg.gpt.stop_text_token, dtype=t.dtype, device=t.device)])
+                else:
+                    padded = t
+                outputs.append(padded)
+            return torch.stack(outputs)  # [batch_size, max_len]
         max_len = max(t.size(1) for t in tokens)
         outputs = []
         for tensor in tokens:

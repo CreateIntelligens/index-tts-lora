@@ -14,19 +14,28 @@
 """
 
 import argparse
+import gc
 import json
 import os
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchaudio
 from loguru import logger
 from omegaconf import OmegaConf
 from tqdm import tqdm
+
+# 確保專案根目錄在 Python 路徑中
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from indextts.utils.feature_extractors import MelSpectrogramFeatures
 from indextts.vqvae.xtts_dvae import DiscreteVAE
@@ -39,6 +48,109 @@ CONFIG_FILENAME = "config.yaml"
 METADATA_FILENAME = "metadata.jsonl"
 TRAIN_SPLIT_RATIO = 0.9
 CONDITION_LATENT_DIM = 32
+
+
+class AudioDataset(torch.utils.data.Dataset):
+    """音頻數據集，用於批次加載和處理"""
+
+    def __init__(self, audio_list_path: str):
+        """
+        Args:
+            audio_list_path: audio_list.txt 文件路徑
+        """
+        self.samples = []
+
+        # 解析 audio_list.txt
+        with open(audio_list_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    parts = line.split('\t')
+                    if len(parts) == 2:
+                        wav_path, text = parts
+                        if os.path.exists(wav_path):
+                            self.samples.append({
+                                'wav_path': wav_path,
+                                'text': text
+                            })
+                except Exception as e:
+                    logger.warning(f"解析失敗: {line}, {e}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        """
+        Returns:
+            dict: {
+                'wav_path': str,
+                'text': str,
+                'audio': torch.Tensor or None,
+                'sr': int or None,
+                'success': bool
+            }
+        """
+        sample = self.samples[idx]
+
+        try:
+            audio, sr = torchaudio.load(sample['wav_path'])
+            return {
+                'wav_path': sample['wav_path'],
+                'text': sample['text'],
+                'audio': audio,
+                'sr': sr,
+                'success': True
+            }
+        except Exception as e:
+            logger.warning(f"加載失敗: {sample['wav_path']}, {e}")
+            return {
+                'wav_path': sample['wav_path'],
+                'text': sample['text'],
+                'audio': None,
+                'sr': None,
+                'success': False
+            }
+
+
+def collate_batch(batch):
+    """
+    整理批次數據
+
+    Args:
+        batch: List[dict] from Dataset.__getitem__
+
+    Returns:
+        dict: {
+            'wav_paths': List[str],
+            'texts': List[str],
+            'audios': List[torch.Tensor],
+            'srs': List[int],
+            'valid_indices': List[int]
+        }
+    """
+    wav_paths = []
+    texts = []
+    audios = []
+    srs = []
+    valid_indices = []
+
+    for i, item in enumerate(batch):
+        if item['success']:
+            wav_paths.append(item['wav_path'])
+            texts.append(item['text'])
+            audios.append(item['audio'])
+            srs.append(item['sr'])
+            valid_indices.append(i)
+
+    return {
+        'wav_paths': wav_paths,
+        'texts': texts,
+        'audios': audios,
+        'srs': srs,
+        'valid_indices': valid_indices
+    }
 
 
 def get_host_uid_gid() -> Tuple[int, int]:
@@ -84,7 +196,19 @@ class AudioProcessor:
         self.dvae = dvae
         self.mel_config = mel_config
         self.device = device
-        self.mel_feature = MelSpectrogramFeatures(**mel_config)
+        self.mel_feature = MelSpectrogramFeatures(**mel_config).to(self.device)
+        self.sample_rate = self.mel_config['sample_rate']
+        self._resamplers: Dict[int, torchaudio.transforms.Resample] = {}
+
+    def _get_resampler(self, source_sr: int) -> torchaudio.transforms.Resample:
+        """取得對應輸入取樣率的重取樣器並搬到正確裝置"""
+        if source_sr not in self._resamplers:
+            resampler = torchaudio.transforms.Resample(
+                orig_freq=source_sr,
+                new_freq=self.sample_rate
+            ).to(self.device)
+            self._resamplers[source_sr] = resampler
+        return self._resamplers[source_sr]
     
     @torch.no_grad()
     def process_audio_data(
@@ -105,13 +229,12 @@ class AudioProcessor:
         # 資料型別轉換
         if isinstance(audio, np.ndarray):
             audio = torch.from_numpy(audio)
+
+        audio = audio.to(self.device)
         
         # 重取樣
-        if sr != self.mel_config['sample_rate']:
-            resampler = torchaudio.transforms.Resample(
-                orig_freq=sr, 
-                new_freq=self.mel_config['sample_rate']
-            )
+        if sr != self.sample_rate:
+            resampler = self._get_resampler(sr)
             audio = resampler(audio)
         
         # 提取梅爾頻譜特徵
@@ -169,64 +292,246 @@ class ConditionExtractor:
         with torch.no_grad():
             condition = self.model.get_conditioning(mel, mel_length)
             condition = condition.squeeze(0).cpu().float().numpy()
-        
+
         return condition
+
+    def extract_condition_latent_batch(self, mels: List[torch.Tensor]) -> List[np.ndarray]:
+        """
+        批次提取 condition latent
+
+        Args:
+            mels: List of mel spectrograms, each [1, mel_bins, T] or [mel_bins, T]
+
+        Returns:
+            List of condition latents, each (32, dim)
+        """
+        if self.model is None:
+            raise ValueError("模型不能為None，需要傳入已載入的UnifiedVoice模型")
+
+        # 標準化輸入格式
+        normalized_mels = []
+        for mel in mels:
+            if isinstance(mel, np.ndarray):
+                mel = torch.from_numpy(mel)
+            # 確保是3維
+            if mel.ndim == 2:
+                mel = mel.unsqueeze(0)
+            elif mel.ndim == 3 and mel.shape[0] == 1:
+                pass
+            else:
+                raise ValueError(f"不支援的mel形狀: {mel.shape}")
+            normalized_mels.append(mel.squeeze(0))  # [mel_bins, T]
+
+        # 找到最大長度並 padding
+        max_len = max(mel.shape[-1] for mel in normalized_mels)
+        padded_mels = []
+        mel_lengths = []
+
+        for mel in normalized_mels:
+            current_len = mel.shape[-1]
+            mel_lengths.append(current_len)
+
+            if current_len < max_len:
+                pad_len = max_len - current_len
+                mel = torch.nn.functional.pad(mel, (0, pad_len))
+
+            padded_mels.append(mel)
+
+        # Stack 成 batch
+        batch_mels = torch.stack(padded_mels).to(self.device)  # [B, mel_bins, T]
+        mel_lengths = torch.tensor(mel_lengths, device=self.device)
+
+        # 批次推理
+        with torch.no_grad():
+            batch_conditions = self.model.get_conditioning(batch_mels, mel_lengths)
+            # 轉回 list
+            conditions = [
+                cond.cpu().float().numpy()
+                for cond in batch_conditions
+            ]
+
+        return conditions
 
 
 class MedoidCalculator:
     """Medoid計算器類"""
     
     @staticmethod
+    def _prepare_medoid_devices(
+        default_device: str,
+        medoid_devices: Optional[Union[str, List[Union[str, int]]]]
+    ) -> List[torch.device]:
+        """解析使用者傳入的裝置列表"""
+        if medoid_devices is None:
+            candidates: List[str] = [default_device]
+        elif isinstance(medoid_devices, str):
+            candidates = [dev.strip() for dev in medoid_devices.split(',') if dev.strip()]
+        else:
+            candidates = []
+            for dev in medoid_devices:
+                if isinstance(dev, int):
+                    candidates.append(f"cuda:{dev}")
+                else:
+                    candidates.append(str(dev))
+
+        parsed_devices: List[torch.device] = []
+        seen: set = set()
+        for dev in candidates:
+            if not dev:
+                continue
+            if dev.isdigit():
+                dev = f"cuda:{dev}"
+            try:
+                torch_device = torch.device(dev)
+            except Exception:
+                logger.warning(f"無法解析裝置 {dev}，已忽略")
+                continue
+
+            if torch_device.type == 'cuda' and not torch.cuda.is_available():
+                logger.warning(f"裝置 {dev} 不可用，改用 CPU")
+                continue
+
+            key = str(torch_device)
+            if key in seen:
+                continue
+            seen.add(key)
+            parsed_devices.append(torch_device)
+
+        if not parsed_devices:
+            logger.warning("未提供有效的 GPU 裝置，將使用 CPU 計算 medoid")
+            parsed_devices = [torch.device('cpu')]
+
+        return parsed_devices
+
+    @staticmethod
     def compute_distance_matrix(
-        data: np.ndarray, 
-        metric: str = 'euclidean'
-    ) -> np.ndarray:
+        data: np.ndarray,
+        metric: str = 'euclidean',
+        device: str = 'cpu',
+        block_size: int = 512,
+        medoid_devices: Optional[Union[str, List[Union[str, int]]]] = None
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        計算距離矩陣
-        
+        以區塊方式計算距離矩陣，支援多 GPU 平行運算
+
         Args:
-            data: 資料矩陣 (N, features)
-            metric: 距離度量方式 ('euclidean' 或 'cosine')
-        
+            data: (N, features) 數組
+            metric: 距離度量方式
+            device: 預設裝置
+            block_size: 每個計算區塊的樣本數
+            medoid_devices: 自訂裝置列表
+
         Returns:
-            距離矩陣 (N, N)
+            (距離矩陣, 每個樣本距離和)
         """
         n = data.shape[0]
-        dist_matrix = np.zeros((n, n))
-        
-        for i in tqdm(range(n), desc="計算距離矩陣"):
-            for j in range(i + 1, n):
-                if metric == 'euclidean':
-                    dist = np.linalg.norm(data[i] - data[j])
-                elif metric == 'cosine':
-                    dist = 1 - np.dot(data[i], data[j]) / (
-                        np.linalg.norm(data[i]) * np.linalg.norm(data[j])
-                    )
-                else:
-                    raise ValueError(f"不支援的距離度量: {metric}")
-                
-                dist_matrix[i, j] = dist
-                dist_matrix[j, i] = dist
-        
-        return dist_matrix
+        if n == 0:
+            return np.zeros((0, 0), dtype=np.float32), np.zeros(0, dtype=np.float64)
+
+        block_size = max(1, int(block_size))
+        block_size = min(block_size, n)
+        row_chunks = [(start, min(start + block_size, n)) for start in range(0, n, block_size)]
+        num_chunks = len(row_chunks)
+
+        devices = MedoidCalculator._prepare_medoid_devices(device, medoid_devices)
+        data_tensor = torch.from_numpy(data).to(torch.float32)
+
+        dist_matrix = np.zeros((n, n), dtype=np.float32)
+        dist_sums = np.zeros(n, dtype=np.float64)
+        chunk_locks = [threading.Lock() for _ in row_chunks]
+        task_queue: Queue = Queue()
+
+        for idx in range(num_chunks):
+            task_queue.put(idx)
+
+        def worker(device_obj: torch.device) -> None:
+            nonlocal metric
+            while True:
+                try:
+                    row_idx = task_queue.get_nowait()
+                except Empty:
+                    break
+
+                start_i, end_i = row_chunks[row_idx]
+                chunk_i = data_tensor[start_i:end_i].to(device_obj, non_blocking=True)
+
+                try:
+                    for col_idx in range(row_idx, num_chunks):
+                        start_j, end_j = row_chunks[col_idx]
+                        chunk_j = data_tensor[start_j:end_j].to(device_obj, non_blocking=True)
+
+                        if metric == 'euclidean':
+                            block = torch.cdist(chunk_i, chunk_j, p=2)
+                        elif metric == 'cosine':
+                            norm_i = F.normalize(chunk_i, dim=1)
+                            norm_j = F.normalize(chunk_j, dim=1)
+                            block = 1 - torch.matmul(norm_i, norm_j.transpose(0, 1))
+                        else:
+                            raise ValueError(f"不支援的距離度量: {metric}")
+
+                        block_np = block.cpu().numpy().astype(np.float32)
+                        dist_matrix[start_i:end_i, start_j:end_j] = block_np
+                        dist_sums[start_i:end_i] += block_np.sum(axis=1, dtype=np.float64)
+
+                        if col_idx != row_idx:
+                            dist_matrix[start_j:end_j, start_i:end_i] = block_np.T
+                            col_contrib = block_np.sum(axis=0, dtype=np.float64)
+                            with chunk_locks[col_idx]:
+                                dist_sums[start_j:end_j] += col_contrib
+
+                        del chunk_j, block, block_np
+                finally:
+                    del chunk_i
+                    task_queue.task_done()
+
+        threads = []
+        for dev in devices:
+            thread = threading.Thread(target=worker, args=(dev,), daemon=True)
+            thread.start()
+            threads.append(thread)
+
+        task_queue.join()
+        for thread in threads:
+            thread.join()
+
+        return dist_matrix, dist_sums
     
     @classmethod
     def find_medoid_condition(
-        cls, 
-        condition_files: List[str], 
-        distance_metric: str = 'euclidean'
+        cls,
+        condition_files: List[str],
+        distance_metric: str = 'euclidean',
+        device: str = 'cpu',
+        batch_size: int = 512,
+        max_samples: int = 5000,
+        gpu_ids: Optional[List[int]] = None,
+        medoid_devices: Optional[List[str]] = None
     ) -> Dict:
         """
         找出condition latent分佈中心的樣本（medoid）
-        
+
         Args:
             condition_files: condition檔案路徑列表
             distance_metric: 距離度量方式
-        
+            device: 計算裝置 ('cpu' 或 'cuda')
+            batch_size: 距離矩陣計算的批次大小（行）
+            max_samples: 列分塊大小（用於記憶體優化）
+            gpu_ids: GPU ID 列表，用於多 GPU 並行（例如 [0,1,2,3]）
+
         Returns:
             medoid資訊字典
         """
-        logger.info(f"開始計算medoid，共{len(condition_files)}個樣本")
+        total_files = len(condition_files)
+        device_list = medoid_devices
+        if device_list is None and gpu_ids:
+            device_list = [f"cuda:{gid}" for gid in gpu_ids]
+        use_multi_gpu = device_list is not None and len(device_list) > 1
+
+        if use_multi_gpu:
+            logger.info(f"開始計算medoid，共 {total_files} 個樣本（多 GPU 區塊計算）")
+            logger.info(f"使用裝置: {device_list}")
+        else:
+            logger.info(f"開始計算medoid，共 {total_files} 個樣本（單裝置區塊計算）")
         
         # 讀取所有condition latent
         conditions = []
@@ -261,13 +566,25 @@ class MedoidCalculator:
         N, H, W = conditions_array.shape
         data_flat = conditions_array.reshape(N, H * W)
         
-        # 計算距離矩陣
+        # 計算距離矩陣（使用分批避免 OOM）
         logger.info("計算距離矩陣...")
-        dist_matrix = cls.compute_distance_matrix(data_flat, distance_metric)
-        
+        block_size = max_samples if max_samples > 0 else batch_size
+        block_size = max(1, min(batch_size, block_size))
+        if block_size != batch_size:
+            logger.info(f"採用區塊大小 {block_size} (由 batch_size={batch_size}, chunk_size={max_samples} 計算)")
+        else:
+            logger.info(f"採用區塊大小 {block_size}")
+
+        dist_matrix, dist_sums = cls.compute_distance_matrix(
+            data_flat,
+            distance_metric,
+            device,
+            block_size=block_size,
+            medoid_devices=device_list
+        )
+
         # 找出medoid
         logger.info("尋找medoid...")
-        dist_sums = np.sum(dist_matrix, axis=1)
         medoid_idx = np.argmin(dist_sums)
         medoid_info = condition_infos[medoid_idx]
         medoid_condition = conditions[medoid_idx]
@@ -289,12 +606,18 @@ class MedoidCalculator:
             }
         }
         
-        return {
+        result = {
             'medoid_info': medoid_info,
             'medoid_condition': medoid_condition,
             'statistics': stats,
             'distance_matrix': dist_matrix
         }
+
+        # 清理臨時變數和 GPU 緩存
+        del conditions_array, data_flat, dist_matrix, dist_sums
+        gc.collect()
+
+        return result
 
 
 def load_unified_voice_model(
@@ -483,6 +806,7 @@ def setup_models(
         strict=True
     )
     dvae.eval()
+    dvae.to(args.device)
     del pre_trained_dvae
     
     # 載入UnifiedVoice模型（如果需要）
@@ -501,91 +825,151 @@ def process_audio_files(
     config: OmegaConf,
     audio_processor: AudioProcessor,
     condition_extractor: Optional[ConditionExtractor],
-    output_dir: str
+    output_dir: str,
+    batch_size: int = 16,
+    num_workers: int = 8
 ) -> Tuple[str, List[str]]:
-    """處理音訊檔案列表"""
+    """
+    批次處理音訊檔案列表
+
+    Args:
+        batch_size: 批次大小（建議 8-16）
+        num_workers: DataLoader worker 數量（建議 4-8）
+    """
     metadata_file = os.path.join(output_dir, METADATA_FILENAME)
     condition_files = []
     metadata_path = Path(metadata_file)
-    
-    with open(args.audio_list, "r", encoding="utf-8") as f:
-        for line in tqdm(f, desc="處理音訊檔案"):
-            try:
-                wav_path, txt = parse_audio_line(line)
-            except ValueError as e:
-                logger.warning(f"跳過無效行: {line.strip()}, 錯誤: {e}")
+
+    # 創建 Dataset 和 DataLoader
+    dataset = AudioDataset(args.audio_list)
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_batch,
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False
+    )
+
+    # 批次處理
+    with tqdm(total=len(dataset), desc="處理音訊檔案") as pbar:
+        for batch in dataloader:
+            # 跳過空批次
+            if len(batch['valid_indices']) == 0:
+                pbar.update(batch_size)
                 continue
-            
-            if not os.path.exists(wav_path):
-                logger.warning(f"音訊檔案未找到: {wav_path}")
-                continue
-            
-            # 讀取音訊檔案
-            try:
-                audio, sr = torchaudio.load(wav_path)
-            except Exception as e:
-                logger.error(f"讀取音訊檔案時出錯: {wav_path}, 錯誤資訊: {e}")
-                continue
-            
-            # 處理音訊資料
-            try:
-                processed_audio, mel, codes = audio_processor.process_audio_data(audio, sr)
-            except Exception as e:
-                logger.error(f"處理音訊資料時出錯: {wav_path}, 錯誤資訊: {e}")
-                continue
-            
-            # 計算音訊時長
-            duration = processed_audio.shape[-1] / config.dataset.mel.sample_rate
-            
-            # 儲存特徵檔案
-            base_name = os.path.basename(wav_path)
-            out_codebook = os.path.join(output_dir, f"{base_name}_codes.npy")
-            out_mel = os.path.join(output_dir, f"{base_name}_mel.npy")
-            
-            try:
-                np.save(out_codebook, codes.cpu().numpy())
-                np.save(out_mel, mel.cpu().numpy())
-                fix_permissions(out_codebook)
-                fix_permissions(out_mel)
-            except Exception as e:
-                logger.error(f"儲存特徵檔案時出錯: {out_codebook}, 錯誤資訊: {e}")
-                continue
-            
-            # 提取condition latent（如果需要）
-            condition_path = None
-            if condition_extractor is not None:
+
+            # 批次處理音頻
+            processed_batch = []
+            for audio, sr, wav_path, text in zip(
+                batch['audios'],
+                batch['srs'],
+                batch['wav_paths'],
+                batch['texts']
+            ):
                 try:
-                    condition = condition_extractor.extract_condition_latent(mel)
-                    condition_path = os.path.join(output_dir, f"{base_name}_condition.npy")
-                    np.save(condition_path, condition)
-                    fix_permissions(condition_path)
-                    condition_files.append(condition_path)
+                    # 處理音訊資料
+                    processed_audio, mel, codes = audio_processor.process_audio_data(audio, sr)
+
+                    processed_batch.append({
+                        'wav_path': wav_path,
+                        'text': text,
+                        'processed_audio': processed_audio,
+                        'mel': mel,
+                        'codes': codes,
+                        'success': True
+                    })
                 except Exception as e:
-                    logger.error(f"提取condition時出錯: {wav_path}, 錯誤資訊: {e}")
+                    logger.error(f"處理音訊失敗: {wav_path}, {e}")
+                    processed_batch.append({
+                        'wav_path': wav_path,
+                        'success': False
+                    })
+
+            # 批次提取 condition（如果需要）
+            if condition_extractor is not None:
+                # 收集所有成功的 mel
+                mels_batch = [item['mel'] for item in processed_batch if item['success']]
+
+                if len(mels_batch) > 0:
+                    try:
+                        # 批次推理 condition
+                        conditions = condition_extractor.extract_condition_latent_batch(mels_batch)
+
+                        # 分配回各個樣本
+                        cond_idx = 0
+                        for item in processed_batch:
+                            if item['success']:
+                                item['condition'] = conditions[cond_idx]
+                                cond_idx += 1
+                    except Exception as e:
+                        logger.error(f"批次提取 condition 失敗: {e}")
+                        # 降級到逐個處理
+                        for item in processed_batch:
+                            if item['success']:
+                                try:
+                                    item['condition'] = condition_extractor.extract_condition_latent(item['mel'])
+                                except Exception as e:
+                                    logger.error(f"提取 condition 失敗: {item['wav_path']}, {e}")
+                                    item['success'] = False
+
+            # 批次保存結果
+            for item in processed_batch:
+                if not item['success']:
                     continue
-            
-            # 寫入元資料
-            try:
-                data_entry = {
-                    "audio": wav_path,
-                    "text": txt,
-                    "codes": os.path.abspath(out_codebook),
-                    "mels": os.path.abspath(out_mel),
-                    "duration": round(duration, 4)
-                }
-                
-                if condition_path:
-                    data_entry["condition"] = os.path.abspath(condition_path)
-                
-                with open(metadata_file, "a", encoding="utf-8") as out_f:
-                    out_f.write(json.dumps(data_entry, ensure_ascii=False) + "\n")
-            except Exception as e:
-                logger.error(f"寫入元資料時出錯: {metadata_file}, 錯誤資訊: {e}")
-                continue
-            finally:
-                if metadata_path.exists():
-                    fix_permissions(metadata_path)
-    
+
+                try:
+                    # 計算音訊時長
+                    duration = item['processed_audio'].shape[-1] / config.dataset.mel.sample_rate
+
+                    # 保存特徵文件
+                    base_name = os.path.basename(item['wav_path'])
+                    out_codebook = os.path.join(output_dir, f"{base_name}_codes.npy")
+                    out_mel = os.path.join(output_dir, f"{base_name}_mel.npy")
+
+                    np.save(out_codebook, item['codes'].detach().cpu().numpy())
+                    np.save(out_mel, item['mel'].detach().cpu().numpy())
+                    fix_permissions(out_codebook)
+                    fix_permissions(out_mel)
+
+                    # 保存 condition
+                    condition_path = None
+                    if 'condition' in item:
+                        condition_path = os.path.join(output_dir, f"{base_name}_condition.npy")
+                        np.save(condition_path, item['condition'])
+                        fix_permissions(condition_path)
+                        condition_files.append(condition_path)
+
+                    # 寫入元資料
+                    data_entry = {
+                        "audio": item['wav_path'],
+                        "text": item['text'],
+                        "codes": os.path.abspath(out_codebook),
+                        "mels": os.path.abspath(out_mel),
+                        "duration": round(duration, 4)
+                    }
+
+                    if condition_path:
+                        data_entry["condition"] = os.path.abspath(condition_path)
+
+                    with open(metadata_file, "a", encoding="utf-8") as out_f:
+                        out_f.write(json.dumps(data_entry, ensure_ascii=False) + "\n")
+
+                    if metadata_path.exists():
+                        fix_permissions(metadata_path)
+
+                except Exception as e:
+                    logger.error(f"保存失敗: {item['wav_path']}, {e}")
+
+            # 更新進度
+            pbar.update(len(batch['audios']))
+
+    # 清理 DataLoader 和 worker 進程
+    del dataloader
+    del dataset
+    gc.collect()
+
     return metadata_file, condition_files
 
 
@@ -622,11 +1006,29 @@ def main():
         help="Path to the UnifiedVoice model checkpoint."
     )
     parser.add_argument(
-        "--device", 
-        default='cuda' if torch.cuda.is_available() else 'cpu', 
+        "--device",
+        default='cuda' if torch.cuda.is_available() else 'cpu',
         help="Device to use for computation."
     )
-    
+    parser.add_argument(
+        "--medoid_devices",
+        type=str,
+        default=None,
+        help="Comma-separated list of devices for medoid calculation (e.g., 'cuda:0,cuda:1')."
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=16,
+        help="批次大小（建議 8-16，根據 GPU 記憶體調整）"
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=8,
+        help="DataLoader worker 數量（建議 4-8）"
+    )
+
     args = parser.parse_args()
     
     # 檢查配置檔案
@@ -656,7 +1058,9 @@ def main():
     
     # 處理音訊檔案
     metadata_file, condition_files = process_audio_files(
-        args, config, audio_processor, condition_extractor, output_dir
+        args, config, audio_processor, condition_extractor, output_dir,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers
     )
     
     logger.info(f"特徵提取完成，結果儲存在: {output_dir}")
@@ -664,21 +1068,108 @@ def main():
     # 計算medoid（如果需要）
     if args.extract_condition and condition_files:
         logger.info("開始計算medoid condition...")
+        total_samples = len(condition_files)
+        logger.info(f"共 {total_samples} 個樣本，使用分批計算（無採樣，完整精確）")
+
+        # 從配置文件讀取 medoid 計算參數
+        config_file_path = "scripts/config.yaml"
+        batch_size = 1000  # 默認值
+        chunk_size = 2000  # 默認值
+
+        if os.path.exists(config_file_path):
+            try:
+                medoid_config = OmegaConf.load(config_file_path)
+                if hasattr(medoid_config, 'medoid_batch_size'):
+                    batch_size = medoid_config.medoid_batch_size
+                if hasattr(medoid_config, 'medoid_chunk_size'):
+                    chunk_size = medoid_config.medoid_chunk_size
+                logger.info(f"從配置文件讀取: medoid_batch_size={batch_size}, medoid_chunk_size={chunk_size}")
+            except Exception as e:
+                logger.warning(f"讀取配置文件失敗，使用默認值: {e}")
+        else:
+            logger.info(f"使用默認值: batch_size={batch_size}, chunk_size={chunk_size}")
+
+        # 檢測可用的 GPU / 裝置
+        gpu_ids = None
+        medoid_device_list: Optional[List[str]] = None
+        if args.medoid_devices:
+            medoid_device_list = [dev.strip() for dev in args.medoid_devices.split(',') if dev.strip()]
+            if medoid_device_list:
+                logger.info(f"使用使用者指定裝置計算 medoid: {medoid_device_list}")
+
+        if medoid_device_list is None and torch.cuda.is_available() and args.device.startswith('cuda'):
+            num_gpus = torch.cuda.device_count()
+            if num_gpus > 1:
+                gpu_ids = list(range(num_gpus))
+                medoid_device_list = [f"cuda:{gid}" for gid in gpu_ids]
+                logger.info(f"檢測到 {num_gpus} 張 GPU，使用多 GPU 並行計算 medoid")
+            else:
+                logger.info("只有 1 張 GPU，使用單 GPU 計算 medoid")
+
         try:
             medoid_result = MedoidCalculator.find_medoid_condition(
-                condition_files, args.distance_metric
+                condition_files, args.distance_metric, args.device,
+                batch_size=batch_size, max_samples=chunk_size,
+                gpu_ids=gpu_ids,
+                medoid_devices=medoid_device_list
             )
             save_medoid_results(medoid_result, output_dir)
+
+            # 清理 GPU 緩存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                logger.warning(f"GPU 記憶體不足: {e}")
+                logger.info("降級使用 CPU 計算 medoid...")
+                # 降級到 CPU
+                try:
+                    torch.cuda.empty_cache()
+                    medoid_result = MedoidCalculator.find_medoid_condition(
+                        condition_files, args.distance_metric, 'cpu',
+                        batch_size=batch_size, max_samples=chunk_size,
+                        gpu_ids=None,
+                        medoid_devices=['cpu']
+                    )
+                    save_medoid_results(medoid_result, output_dir)
+                except Exception as e2:
+                    logger.error(f"計算medoid時出錯: {e2}")
+            else:
+                raise
         except Exception as e:
             logger.error(f"計算medoid時出錯: {e}")
     
     # 分割資料集
     split_dataset(metadata_file, output_dir)
-    
+
     # 儲存說話人資訊
     with open(metadata_file, 'r', encoding='utf-8') as f:
         lines = f.readlines()
     save_speaker_info(args.audio_list, output_dir, lines)
+
+    # 清理 GPU 記憶體
+    logger.info("清理 GPU 記憶體...")
+
+    # 同步所有 GPU 操作
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    # 刪除模型和處理器
+    del dvae
+    del unified_voice_model
+    del audio_processor
+    del condition_extractor
+
+    # 強制垃圾回收
+    gc.collect()
+
+    # 清空 GPU 緩存
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        # 再次同步確保清理完成
+        torch.cuda.synchronize()
+
+    logger.info("記憶體清理完成")
 
 
 if __name__ == "__main__":

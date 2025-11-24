@@ -52,13 +52,19 @@ def fix_file_permissions(filepath: Path):
 
 
 def has_audio_files(directory: Path) -> bool:
-    """檢查目錄是否直接包含音頻文件"""
+    """檢查目錄及其子目錄是否包含音頻文件"""
     return len(list(directory.rglob("*.wav"))) > 0
 
 
 def scan_speaker_dirs(base_dir: Path) -> List[Path]:
     """
     自動掃描數據目錄下的所有說話人子目錄
+    支援多層結構:
+      1. data/speaker_001/*.wav  (直接包含音頻)
+      2. data/drama1/speaker_001/*.wav  (兩層)
+      3. data/drama1/speaker_001/session_01/*.wav  (三層或更多)
+
+    策略:找到最接近 base_dir 且包含音頻的目錄層級
 
     Args:
         base_dir: 基礎數據目錄 (如 data/)
@@ -66,11 +72,41 @@ def scan_speaker_dirs(base_dir: Path) -> List[Path]:
     Returns:
         說話人目錄列表
     """
-    # 只掃描直接子目錄
     speaker_dirs = []
+
+    # 先掃描第一層子目錄
     for subdir in sorted(base_dir.iterdir()):
-        if subdir.is_dir() and has_audio_files(subdir):
+        if not subdir.is_dir():
+            continue
+
+        # 檢查第一層是否直接有音頻(不算子目錄裡的)
+        direct_audio = len(list(subdir.glob("*.wav"))) > 0
+
+        if direct_audio:
+            # 情況 1: data/speaker_001/*.wav 直接包含音頻
             speaker_dirs.append(subdir)
+        else:
+            # 往下找一層(第二層)
+            has_second_level = False
+            for sub_subdir in sorted(subdir.iterdir()):
+                if not sub_subdir.is_dir():
+                    continue
+
+                # 檢查第二層是否直接有音頻
+                second_level_audio = len(list(sub_subdir.glob("*.wav"))) > 0
+
+                if second_level_audio:
+                    # 情況 2: data/drama1/speaker_001/*.wav
+                    speaker_dirs.append(sub_subdir)
+                    has_second_level = True
+                elif has_audio_files(sub_subdir):
+                    # 情況 3: data/drama1/speaker_001/session/*.wav (音頻在更深層)
+                    speaker_dirs.append(sub_subdir)
+                    has_second_level = True
+
+            # 如果第二層沒找到,可能整個第一層目錄就是一個 speaker
+            if not has_second_level and has_audio_files(subdir):
+                speaker_dirs.append(subdir)
 
     return speaker_dirs
 
@@ -219,6 +255,13 @@ def main():
         help='手動指定說話人 ID (僅單說話人時有效，覆蓋自動推斷)'
     )
 
+    parser.add_argument(
+        '--split-size',
+        type=int,
+        default=0,
+        help='自動分割大小（每個 part 的行數，0 表示不分割）。建議: 50000-100000'
+    )
+
     args = parser.parse_args()
 
     # 確定要處理的說話人目錄
@@ -289,25 +332,17 @@ def main():
 
     for speaker_dir in speaker_dirs:
         # 智能提取 speaker_id
+        # 策略: 如果有父目錄(非 base_dir),包含父目錄名稱避免衝突
         speaker_id = speaker_dir.name
 
-        # 如果是通用目錄名（如 data），嘗試智能推斷
+        # 檢查是否有父目錄(在 base_dir 之下)
+        # 例如: data/drama1/001/ 會取 drama1_001
+        parent_dir = speaker_dir.parent.name
         generic_names = ['data', 'audio', 'dataset', 'train', 'finetune', 'wav', 'wavs']
-        if speaker_id.lower() in generic_names:
-            # 方法 1: 檢查是否有數字命名的子目錄（常見模式）
-            subdirs = [d for d in speaker_dir.iterdir() if d.is_dir()]
-            numeric_subdirs = [d for d in subdirs if d.name.isdigit()]
 
-            if numeric_subdirs:
-                # 使用第一個數字子目錄作為 speaker_id
-                speaker_id = f"speaker_{numeric_subdirs[0].name}"
-            else:
-                # 方法 2: 從絕對路徑中提取
-                abs_parts = speaker_dir.resolve().parts
-                for part in reversed(abs_parts):
-                    if part.lower() not in generic_names and part != '/':
-                        speaker_id = part
-                        break
+        if parent_dir.lower() not in generic_names:
+            # 父目錄不是通用名稱,加上父目錄前綴避免衝突
+            speaker_id = f"{parent_dir}_{speaker_id}"
 
         print(f"📦 處理說話人: {speaker_id}")
 
@@ -380,15 +415,37 @@ def main():
 
         if args.merge_all:
             merged_file = output_dir / "audio_list_all.txt"
-            with open(merged_file, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(all_entries))
 
-            fix_file_permissions(merged_file)
+            # 檢查是否需要分割
+            if args.split_size > 0 and len(all_entries) > args.split_size:
+                # 自動分割成多個 part
+                num_parts = (len(all_entries) + args.split_size - 1) // args.split_size
+                print(f"\n📦 自動分割: {len(all_entries)} 條 → {num_parts} 個 part (每個 {args.split_size} 條)")
 
-            merged_file_path = str(merged_file)
+                for i in range(num_parts):
+                    start_idx = i * args.split_size
+                    end_idx = min((i + 1) * args.split_size, len(all_entries))
+                    part_entries = all_entries[start_idx:end_idx]
 
-            print(f"\n📄 合併文件: {merged_file}")
-            print(f"   來源說話人數: {len(results)} 位")
+                    part_file = output_dir / f"audio_list_part_{i}.txt"
+                    with open(part_file, 'w', encoding='utf-8') as f:
+                        f.write('\n'.join(part_entries))
+
+                    fix_file_permissions(part_file)
+                    print(f"   📄 Part {i}: {part_file} ({len(part_entries)} 條)")
+
+                print(f"\n✅ 已生成 {num_parts} 個 part 文件，可用於多 GPU 並行處理")
+            else:
+                # 不分割，生成單個文件
+                with open(merged_file, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(all_entries))
+
+                fix_file_permissions(merged_file)
+
+                merged_file_path = str(merged_file)
+
+                print(f"\n📄 合併文件: {merged_file}")
+                print(f"   來源說話人數: {len(results)} 位")
 
     print_summary(results, total_count, merged_file_path)
 

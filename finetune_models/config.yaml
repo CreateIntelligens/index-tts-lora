@@ -111,8 +111,14 @@ train:
     finetune_model_dir: "finetune_models" # 微調模型根目錄
     seed: 91
     epochs: 15
-    # batch_size 在此指令碼中固定為 1
-    gradient_accumulation_steps: 4
+
+    # === GPU 使用率優化參數 - 針對 A100 80GB 優化 ===
+    batch_size: 64              # 🚀 從 16 → 64，充分利用 80GB
+    valid_batch_size: 128       # 驗證時可以更大
+    num_workers: 8              # 減少 workers（16 太多了）
+    valid_num_workers: 4
+
+    gradient_accumulation_steps: 2  # 從 8 → 2，有效 batch = 64×2 = 128
     max_grad_norm: 1.0
     text_weight: 0.1
     early_stopping_patience: 1
