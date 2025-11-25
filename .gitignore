@@ -20,3 +20,8 @@ checkpoints/
 result/
 finetune_data/
 logs/
+
+# 編譯的二進制文件
+*.so
+*.o
+*.a
