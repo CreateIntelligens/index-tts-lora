@@ -30,8 +30,10 @@ services:
     # 掛載卷 - 掛載整個專案目錄
     volumes:
       - .:/workspace/index-tts-lora
-      # for p4
+      # for p5
       - /mnt/data/output1119:/workspace/index-tts-lora/data
+      # for A4000
+      - /mnt/nas/ml-material/segment_data/output/:/workspace/index-tts-lora/data
 
     working_dir: /workspace/index-tts-lora
 

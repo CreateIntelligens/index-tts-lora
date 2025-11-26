@@ -4,9 +4,10 @@ import sys
 import time
 import warnings
 from subprocess import CalledProcessError
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import torch
+import torch.nn as nn
 import torchaudio
 from omegaconf import OmegaConf
 from torch.nn.utils.rnn import pad_sequence
@@ -35,18 +36,211 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
+def _get_parent_module(model: nn.Module, name: str) -> nn.Module:
+    """
+    獲取模型中指定名稱的父模組。
+    
+    Args:
+        model: 根模型
+        name: 完整的模組路徑名稱（如 'gpt.h.0.attn.c_attn'）
+    
+    Returns:
+        父模組
+    """
+    parts = name.split('.')
+    parent = model
+    for part in parts[:-1]:
+        parent = getattr(parent, part)
+    return parent
+
+
+def _quantize_linear_layers_to_int8(model: nn.Module, target_modules: Optional[List[str]] = None, verbose: bool = True) -> int:
+    """
+    將模型中的 nn.Linear 層替換為 bitsandbytes 的 Linear8bitLt。
+    
+    Args:
+        model: 要量化的模型
+        target_modules: 要量化的模組名稱列表。如果為 None，則量化所有 Linear 層。
+                       例如: ['gpt', 'text_head', 'mel_head']
+        verbose: 是否輸出詳細日誌
+    
+    Returns:
+        替換的層數
+    
+    Note:
+        此函數會就地修改模型。
+    """
+    try:
+        import bitsandbytes as bnb
+    except ImportError:
+        raise ImportError(
+            "bitsandbytes 未安裝。請使用以下命令安裝：\n"
+            "pip install bitsandbytes"
+        )
+    
+    replaced_count = 0
+    total_params_before = 0
+    total_params_after = 0
+    
+    # 收集所有需要替換的模組
+    modules_to_replace = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            # 檢查是否在目標模組列表中
+            if target_modules is not None:
+                should_replace = any(name.startswith(target) or name == target for target in target_modules)
+                if not should_replace:
+                    continue
+            
+            modules_to_replace.append((name, module))
+    
+    if verbose:
+        print(f">> [量化] 找到 {len(modules_to_replace)} 個可量化的 Linear 層")
+    
+    # 替換模組
+    for name, module in modules_to_replace:
+        parent = _get_parent_module(model, name)
+        child_name = name.split('.')[-1]
+        
+        # 計算參數量（用於顯存估算）
+        param_count = module.in_features * module.out_features
+        total_params_before += param_count * 4  # FP32 = 4 bytes
+        total_params_after += param_count * 1   # INT8 = 1 byte
+        
+        # 創建 8bit Linear 層
+        has_bias = module.bias is not None
+        quantized_linear = bnb.nn.Linear8bitLt(
+            module.in_features,
+            module.out_features,
+            bias=has_bias,
+            has_fp16_weights=False,
+            threshold=6.0,  # 離群值閾值
+        )
+        
+        # 複製權重（bitsandbytes 會自動量化）
+        quantized_linear.weight = bnb.nn.Int8Params(
+            module.weight.data.contiguous(),
+            requires_grad=False
+        )
+        if has_bias:
+            quantized_linear.bias = nn.Parameter(module.bias.data.clone())
+        
+        # 替換模組
+        setattr(parent, child_name, quantized_linear)
+        replaced_count += 1
+        
+        if verbose and replaced_count <= 5:
+            print(f">>   - 量化: {name} ({module.in_features}x{module.out_features})")
+    
+    if verbose and replaced_count > 5:
+        print(f">>   - ... 還有 {replaced_count - 5} 個層")
+    
+    if verbose:
+        mem_before_mb = total_params_before / (1024 * 1024)
+        mem_after_mb = total_params_after / (1024 * 1024)
+        savings_pct = (1 - total_params_after / total_params_before) * 100 if total_params_before > 0 else 0
+        print(f">> [量化] 權重記憶體: {mem_before_mb:.1f}MB → {mem_after_mb:.1f}MB (節省 {savings_pct:.0f}%)")
+    
+    return replaced_count
+
+
+def _quantize_linear_layers_to_int4(model: nn.Module, target_modules: Optional[List[str]] = None, verbose: bool = True) -> int:
+    """
+    將模型中的 nn.Linear 層替換為 bitsandbytes 的 Linear4bit (NF4)。
+    
+    Args:
+        model: 要量化的模型
+        target_modules: 要量化的模組名稱列表
+        verbose: 是否輸出詳細日誌
+    
+    Returns:
+        替換的層數
+    """
+    try:
+        import bitsandbytes as bnb
+    except ImportError:
+        raise ImportError(
+            "bitsandbytes 未安裝。請使用以下命令安裝：\n"
+            "pip install bitsandbytes"
+        )
+    
+    replaced_count = 0
+    total_params_before = 0
+    total_params_after = 0
+    
+    # 收集所有需要替換的模組
+    modules_to_replace = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            if target_modules is not None:
+                should_replace = any(name.startswith(target) or name == target for target in target_modules)
+                if not should_replace:
+                    continue
+            modules_to_replace.append((name, module))
+    
+    if verbose:
+        print(f">> [量化] 找到 {len(modules_to_replace)} 個可量化的 Linear 層")
+    
+    # 替換模組
+    for name, module in modules_to_replace:
+        parent = _get_parent_module(model, name)
+        child_name = name.split('.')[-1]
+        
+        # 計算參數量
+        param_count = module.in_features * module.out_features
+        total_params_before += param_count * 4   # FP32 = 4 bytes
+        total_params_after += param_count * 0.5  # INT4 = 0.5 byte
+        
+        has_bias = module.bias is not None
+        quantized_linear = bnb.nn.Linear4bit(
+            module.in_features,
+            module.out_features,
+            bias=has_bias,
+            compute_dtype=torch.bfloat16,
+            quant_type='nf4',  # 使用 NF4 量化
+        )
+        
+        # 複製權重
+        quantized_linear.weight = bnb.nn.Params4bit(
+            module.weight.data.contiguous(),
+            requires_grad=False,
+            quant_type='nf4'
+        )
+        if has_bias:
+            quantized_linear.bias = nn.Parameter(module.bias.data.clone())
+        
+        setattr(parent, child_name, quantized_linear)
+        replaced_count += 1
+        
+        if verbose and replaced_count <= 5:
+            print(f">>   - 量化: {name} ({module.in_features}x{module.out_features})")
+    
+    if verbose and replaced_count > 5:
+        print(f">>   - ... 還有 {replaced_count - 5} 個層")
+    
+    if verbose:
+        mem_before_mb = total_params_before / (1024 * 1024)
+        mem_after_mb = total_params_after / (1024 * 1024)
+        savings_pct = (1 - total_params_after / total_params_before) * 100 if total_params_before > 0 else 0
+        print(f">> [量化] 權重記憶體: {mem_before_mb:.1f}MB → {mem_after_mb:.1f}MB (節省 {savings_pct:.0f}%)")
+    
+    return replaced_count
+
 class IndexTTS:
     def __init__(
         self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", is_fp16=True, device=None, use_cuda_kernel=None,
         speaker_info_path=None,  # 新增：說話人資訊檔案路徑
+        precision_config=None,  # 新增：細粒度混合精度配置
     ):
         """
         Args:
             cfg_path (str): path to the config file.
             model_dir (str): path to the model directory.
-            is_fp16 (bool): whether to use fp16.
+            is_fp16 (bool): whether to use fp16 (deprecated, use precision_config instead).
             device (str): device to use (e.g., 'cuda:0', 'cpu'). If None, it will be set automatically based on the availability of CUDA or MPS.
             use_cuda_kernel (None | bool): whether to use BigVGan custom fused activation CUDA kernel, only for CUDA device.
+            precision_config (dict): 細粒度混合精度配置，例如: {'gpt': 'bf16', 'vocoder': 'bf16'}
         """
         if device is not None:
             self.device = device
@@ -68,7 +262,100 @@ class IndexTTS:
 
         self.cfg = OmegaConf.load(cfg_path)
         self.model_dir = model_dir
-        self.dtype = torch.float16 if self.is_fp16 else None
+
+        # 處理混合精度配置
+        # 優先順序：1. precision_config 參數 -> 2. config_inference.yaml -> 3. config.yaml 的 inference 區塊
+        if precision_config is None:
+            # 先嘗試讀取專門的推理配置檔
+            inference_config_path = os.path.join(model_dir, "config_inference.yaml")
+            if os.path.exists(inference_config_path):
+                inference_cfg = OmegaConf.load(inference_config_path)
+                if hasattr(inference_cfg, 'inference'):
+                    precision_config = inference_cfg.inference
+                    print(f">> 載入推理配置: {inference_config_path}")
+            # 回退到原始 config.yaml 的 inference 區塊
+            elif hasattr(self.cfg, 'inference'):
+                precision_config = self.cfg.inference
+
+        # 解析精度配置
+        def resolve_dtype(precision_str):
+            if precision_str in ["bf16", "bfloat16"]:
+                return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            elif precision_str in ["fp16", "float16"]:
+                return torch.float16
+            elif precision_str in ["fp8"]:
+                return torch.float8_e4m3fn if hasattr(torch, 'float8_e4m3fn') else torch.bfloat16
+            else:  # fp32, no, None
+                return torch.float32
+
+        if precision_config and isinstance(precision_config, dict):
+            # 讀取推理配置（inference.gpt, inference.vocoder, inference.quantization）
+            gpt_precision = precision_config.get('gpt', 'bf16')
+            vocoder_precision = precision_config.get('vocoder', 'bf16')
+
+            quant_cfg = precision_config.get('quantization', {})
+            quant_enabled = quant_cfg.get('enabled', False)
+
+            # 設定精度和量化
+            if quant_enabled:
+                # 進階模式：weight_dtype + compute_dtype
+                weight_dtype = quant_cfg.get('weight_dtype', 'int8')
+                compute_dtype = quant_cfg.get('compute_dtype', 'bf16')
+
+                self.gpt_weight_dtype = weight_dtype
+                self.gpt_compute_dtype = resolve_dtype(compute_dtype)
+                self.use_quantization = True
+                self.load_in_8bit = (weight_dtype == 'int8')
+                self.load_in_4bit = (weight_dtype == 'int4')
+
+                print(f">> 使用量化推理 (進階模式):")
+                print(f"   - 權重存儲: {weight_dtype.upper()} (省 {'75%' if weight_dtype == 'int8' else '87.5%'} 顯存)")
+                print(f"   - 運算精度: {self.gpt_compute_dtype}")
+                print(f"   - Vocoder: {vocoder_precision}")
+
+            elif gpt_precision == 'int8':
+                # 簡單模式：int8 (權重 INT8 + 運算 BF16)
+                self.gpt_weight_dtype = 'int8'
+                self.gpt_compute_dtype = torch.bfloat16
+                self.use_quantization = True
+                self.load_in_8bit = True
+                self.load_in_4bit = False
+                print(f">> 使用 INT8 量化推理: 權重=INT8, 運算=BF16, Vocoder={vocoder_precision}")
+
+            elif gpt_precision == 'int4':
+                # 簡單模式：int4 (權重 INT4 + 運算 BF16)
+                self.gpt_weight_dtype = 'int4'
+                self.gpt_compute_dtype = torch.bfloat16
+                self.use_quantization = True
+                self.load_in_8bit = False
+                self.load_in_4bit = True
+                print(f">> 使用 INT4 量化推理: 權重=INT4, 運算=BF16, Vocoder={vocoder_precision}")
+
+            else:
+                # 標準模式：直接使用指定精度
+                self.gpt_dtype = resolve_dtype(gpt_precision)
+                self.use_quantization = False
+                self.load_in_8bit = False
+                self.load_in_4bit = False
+                print(f">> 使用混合精度推理: GPT={self.gpt_dtype}, Vocoder={vocoder_precision}")
+
+            self.vocoder_dtype = resolve_dtype(vocoder_precision)
+            self.dvae_dtype = self.gpt_dtype if not self.use_quantization and isinstance(self.gpt_dtype, torch.dtype) else torch.bfloat16
+        else:
+            # 向後兼容：使用 is_fp16
+            if self.is_fp16:
+                self.gpt_dtype = torch.float16
+                self.vocoder_dtype = torch.float16
+                self.dvae_dtype = torch.float16
+                print(">> 使用 FP16 推理")
+            else:
+                self.gpt_dtype = torch.float32
+                self.vocoder_dtype = torch.float32
+                self.dvae_dtype = torch.float32
+                print(">> 使用 FP32 推理")
+
+        # 向後兼容
+        self.dtype = self.gpt_dtype if self.gpt_dtype != torch.float32 else None
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
 
         # Comment-off to load the VQ-VAE model for debugging tokenizer
@@ -84,15 +371,84 @@ class IndexTTS:
         # else:
         #     self.dvae.eval()
         # print(">> vqvae weights restored from:", self.dvae_path)
-        self.gpt = UnifiedVoice(**self.cfg.gpt)
         self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
-        load_checkpoint(self.gpt, self.gpt_path)
-        self.gpt = self.gpt.to(self.device)
-        if self.is_fp16:
-            self.gpt.eval().half()
+
+        # 使用量化載入
+        if self.use_quantization:
+            try:
+                import bitsandbytes as bnb
+
+                # 載入模型（先以 FP32 載入）
+                self.gpt = UnifiedVoice(**self.cfg.gpt)
+                load_checkpoint(self.gpt, self.gpt_path)
+                self.gpt = self.gpt.to(self.device)
+                
+                # 定義要量化的模組（GPT 核心部分）
+                # gpt 是 HuggingFace GPT2Model，包含主要的 Transformer 層
+                target_modules = ['gpt', 'text_head', 'mel_head']
+                
+                # 執行動態量化
+                print("=" * 60)
+                print(">> 🔧 開始 GPT 模型量化...")
+                print("=" * 60)
+                
+                if self.load_in_8bit:
+                    replaced = _quantize_linear_layers_to_int8(self.gpt, target_modules, verbose=True)
+                    quant_type = "INT8"
+                elif self.load_in_4bit:
+                    replaced = _quantize_linear_layers_to_int4(self.gpt, target_modules, verbose=True)
+                    quant_type = "INT4 (NF4)"
+                else:
+                    replaced = 0
+                    quant_type = "UNKNOWN"
+                
+                if replaced > 0:
+                    print("=" * 60)
+                    print(f">> ✅ 量化完成！")
+                    print(f">>    - 量化類型: {quant_type}")
+                    print(f">>    - 量化層數: {replaced}")
+                    print(f">>    - 模型路徑: {self.gpt_path}")
+                    print("=" * 60)
+                    self.gpt.eval()
+                else:
+                    print(">> ⚠️  未找到可量化的層，回退到 BF16")
+                    self.use_quantization = False
+                    self.gpt.eval().to(torch.bfloat16)
+                    print(f">> GPT weights restored from: {self.gpt_path} (dtype: BF16)")
+
+            except ImportError:
+                print(">> ⚠️  bitsandbytes 未安裝，回退到 BF16")
+                print(">> 安裝: pip install bitsandbytes")
+                self.use_quantization = False
+                self.gpt = UnifiedVoice(**self.cfg.gpt)
+                load_checkpoint(self.gpt, self.gpt_path)
+                self.gpt = self.gpt.to(self.device)
+                self.gpt.eval().to(torch.bfloat16)
+                print(f">> GPT weights restored from: {self.gpt_path} (dtype: BF16)")
+            except Exception as e:
+                print(f">> ⚠️  量化失敗: {e}")
+                print(">> 回退到 BF16 精度")
+                self.use_quantization = False
+                # 重新載入模型
+                self.gpt = UnifiedVoice(**self.cfg.gpt)
+                load_checkpoint(self.gpt, self.gpt_path)
+                self.gpt = self.gpt.to(self.device)
+                self.gpt.eval().to(torch.bfloat16)
+                print(f">> GPT weights restored from: {self.gpt_path} (dtype: BF16)")
         else:
-            self.gpt.eval()
-        print(">> GPT weights restored from:", self.gpt_path)
+            # 標準精度載入
+            self.gpt = UnifiedVoice(**self.cfg.gpt)
+            load_checkpoint(self.gpt, self.gpt_path)
+            self.gpt = self.gpt.to(self.device)
+
+            # 使用細粒度精度
+            if self.gpt_dtype == torch.float16:
+                self.gpt.eval().half()
+            elif self.gpt_dtype == torch.bfloat16:
+                self.gpt.eval().to(torch.bfloat16)
+            else:
+                self.gpt.eval()
+            print(f">> GPT weights restored from: {self.gpt_path} (dtype: {self.gpt_dtype})")
         if self.is_fp16:
             try:
                 import deepspeed
@@ -127,10 +483,17 @@ class IndexTTS:
         vocoder_dict = torch.load(self.bigvgan_path, map_location="cpu")
         self.bigvgan.load_state_dict(vocoder_dict["generator"])
         self.bigvgan = self.bigvgan.to(self.device)
+
+        # 使用細粒度精度
+        if self.vocoder_dtype == torch.float16:
+            self.bigvgan.half()
+        elif self.vocoder_dtype == torch.bfloat16:
+            self.bigvgan.to(torch.bfloat16)
+
         # remove weight norm on eval mode
         self.bigvgan.remove_weight_norm()
         self.bigvgan.eval()
-        print(">> bigvgan weights restored from:", self.bigvgan_path)
+        print(f">> bigvgan weights restored from: {self.bigvgan_path} (dtype: {self.vocoder_dtype})")
         self.bpe_path = os.path.join(self.model_dir, self.cfg.dataset["bpe_model"])
         self.normalizer = TextNormalizer()
         self.normalizer.load()

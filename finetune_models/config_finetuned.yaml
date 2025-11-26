@@ -1,3 +1,17 @@
+workflow:
+  paths:
+    data_source_dir: data0
+    audio_list_dir: finetune_data/audio_list
+    processed_data_dir: finetune_data/processed_data
+    log_dir: logs
+  prepare:
+    split_size: 100000
+  extract:
+    batch_size: 16
+    num_workers: 8
+  medoid:
+    batch_size: 10000
+    chunk_size: 20000
 dataset:
   bpe_model: bpe.model
   sample_rate: 24000
@@ -146,12 +160,17 @@ train:
   finetune_model_dir: finetune_models
   seed: 91
   epochs: 15
-  gradient_accumulation_steps: 4
+  batch_size: 64
+  valid_batch_size: 128
+  num_workers: 8
+  valid_num_workers: 4
+  gradient_accumulation_steps: 2
   max_grad_norm: 1.0
   text_weight: 0.1
   early_stopping_patience: 1
   max_steps_per_epoch: 150
   data_path: finetune_data/processed_data
+  mixed_precision: "auto"  # 訓練運算精度 (選項: "auto", "fp8", "bf16", "fp16", "fp32")
   optimizer:
     learning_rate: 5.0e-05
     weight_decay: 0.01

@@ -1,5 +1,5 @@
 docs/
-data/
+data*/
 
 venv/
 __pycache__
@@ -17,6 +17,7 @@ build/
 *.egg-info/
 .venv
 checkpoints/
+!checkpoints/config_inference.yaml
 result/
 finetune_data/
 logs/

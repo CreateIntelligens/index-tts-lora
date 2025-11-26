@@ -262,6 +262,11 @@ def main():
         help='自動分割大小（每個 part 的行數，0 表示不分割）。建議: 50000-100000'
     )
 
+    parser.add_argument(
+        '--output-dir',
+        help='指定輸出目錄 (默認: finetune_data/audio_list)'
+    )
+
     args = parser.parse_args()
 
     # 確定要處理的說話人目錄
@@ -319,7 +324,7 @@ def main():
                 sys.exit(1)
 
     # 創建輸出目錄
-    output_dir = Path("finetune_data/audio_list")
+    output_dir = Path(args.output_dir) if args.output_dir else Path("finetune_data/audio_list")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 修復目錄權限

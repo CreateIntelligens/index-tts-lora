@@ -93,31 +93,32 @@ run_gpu_worker() {
 extract_features() {
     print_header "提取音頻特徵"
 
-    local base_dir="finetune_data/audio_list"
+    # 從配置讀取所有參數（使用統一配置 finetune_models/config.yaml）
+    local audio_list_dir=$(read_config "workflow.paths.audio_list_dir" "finetune_data/audio_list")
+    local log_dir=$(read_config "workflow.paths.log_dir" "logs")
+    local batch_size=$(read_config "workflow.extract.batch_size" "32")
+    local num_workers=$(read_config "workflow.extract.num_workers" "12")
+    local gpu_csv=$(read_config "workflow.extract.gpus" "")
 
-    # 從配置讀取所有參數
-    local batch_size=$(read_config "batch_size" "32")
-    local num_workers=$(read_config "num_workers" "12")
-    local gpu_csv=$(read_config "gpus" "")
-
+    print_info "音頻列表目錄: $audio_list_dir"
     print_info "使用配置: batch_size=${batch_size}, num_workers=${num_workers}"
 
     # 檢查目錄
-    if [ ! -d "$base_dir" ]; then
-        print_error "找不到 $base_dir 目錄，請先執行 ./run.sh prepare"
+    if [ ! -d "$audio_list_dir" ]; then
+        print_error "找不到 $audio_list_dir 目錄，請先執行 ./run.sh prepare"
         exit 1
     fi
 
     # 自動查找所有 part 文件
     local audio_lists=()
     shopt -s nullglob
-    for file in "$base_dir"/audio_list_part_*.txt; do
+    for file in "$audio_list_dir"/audio_list_part_*.txt; do
         audio_lists+=("$file")
     done
 
     # 如果沒有 part 文件，查找其他 txt 文件
     if [ "${#audio_lists[@]}" -eq 0 ]; then
-        for file in "$base_dir"/*.txt; do
+        for file in "$audio_list_dir"/*.txt; do
             audio_lists+=("$file")
         done
     fi
@@ -146,9 +147,9 @@ extract_features() {
     print_info "發現 ${#audio_lists[@]} 個檔案，使用 ${#gpu_ids[@]} 張 GPU (${gpu_ids[*]})"
 
     # 創建日誌目錄
-    local log_dir="logs/extract_$(date +%Y%m%d_%H%M%S)"
-    mkdir -p "$log_dir"
-    print_info "日誌目錄: $log_dir"
+    local extract_log_dir="${log_dir}/extract_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$extract_log_dir"
+    print_info "日誌目錄: $extract_log_dir"
 
     # 創建任務文件
     local task_file=$(mktemp)
@@ -162,12 +163,12 @@ extract_features() {
     # 啟動 GPU workers
     local -a pids=()
     for gpu_id in "${gpu_ids[@]}"; do
-        run_gpu_worker "$gpu_id" "$task_file" "$task_lock" "$stats_file" "$batch_size" "$num_workers" "$log_dir" &
+        run_gpu_worker "$gpu_id" "$task_file" "$task_lock" "$stats_file" "$batch_size" "$num_workers" "$extract_log_dir" &
         pids+=($!)
     done
 
     echo ""
-    print_info "監控進度: tail -f $log_dir/*.log"
+    print_info "監控進度: tail -f $extract_log_dir/*.log"
     echo ""
 
     # 等待所有 worker 完成

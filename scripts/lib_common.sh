@@ -51,20 +51,41 @@ if [ "$IN_CONTAINER" -eq 1 ]; then
     USE_DOCKER=0
 fi
 
-# 配置文件路徑
-CONFIG_FILE="scripts/config.yaml"
+# 配置文件路徑（統一使用 finetune_models/config.yaml）
+CONFIG_FILE="finetune_models/config.yaml"
 
-# 讀取配置
+# 讀取配置（支援任意深度嵌套路徑，如 workflow.paths.data_source_dir）
 read_config() {
     local key=$1
     local default=$2
 
-    if [ -f "$CONFIG_FILE" ]; then
-        local value=$(grep "^${key}:" "$CONFIG_FILE" | awk '{print $2}' | head -1)
-        echo "${value:-$default}"
-    else
+    if [ ! -f "$CONFIG_FILE" ]; then
         echo "$default"
+        return
     fi
+
+    # 使用 Python 解析 YAML（支援任意深度嵌套）
+    local value=$(python3 -c "
+import yaml
+import sys
+try:
+    with open('$CONFIG_FILE', 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+    # 支援點號分隔的路徑（如 workflow.paths.data_source_dir）
+    keys = '$key'.split('.')
+    value = config
+    for k in keys:
+        if isinstance(value, dict) and k in value:
+            value = value[k]
+        else:
+            value = None
+            break
+    print(value if value is not None else '$default')
+except:
+    print('$default')
+" 2>/dev/null)
+
+    echo "$value"
 }
 
 # 檢查容器狀態

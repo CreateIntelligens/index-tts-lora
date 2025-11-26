@@ -56,6 +56,7 @@ from indextts.gpt.model import UnifiedVoice
 # Import train utilities
 from train import (
     load_UnifiedVoice,
+    normalize_state_dict_keys,
     clear_torch_cache,
     forward_gpt2,
     forward_UnifiedVoice,
@@ -419,7 +420,8 @@ class DDPTrainer:
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
         # 載入模型權重
-        self.model.module.load_state_dict(checkpoint['model_state_dict'])
+        cleaned_state = normalize_state_dict_keys(checkpoint['model_state_dict'])
+        self.model.module.load_state_dict(cleaned_state)
         if self.is_main_process:
             logger.info("✓ Model state loaded")
 

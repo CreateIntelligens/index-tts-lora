@@ -6,7 +6,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     CUDA_HOME=/usr/local/cuda \
     PATH=/usr/local/cuda/bin:${PATH} \
-    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \
+    PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu121
 
 # 安裝系統依賴
 RUN apt-get update && apt-get install -y \
@@ -32,11 +33,11 @@ RUN python3 -m pip install --upgrade pip setuptools wheel
 WORKDIR /workspace/index-tts-lora
 
 # 首先安裝 PyTorch (CUDA 12.1 版本)
-RUN pip3 install torch==2.1.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu121
+RUN pip3 install --extra-index-url ${PIP_EXTRA_INDEX_URL} torch==2.1.2 torchaudio==2.1.2
 
 # 複製並安裝依賴
 COPY requirements.txt .
-RUN pip3 install -r requirements.txt
+RUN pip3 install --extra-index-url ${PIP_EXTRA_INDEX_URL} -r requirements.txt
 
 # 不在映像中創建目錄,讓掛載時自動創建 (使用宿主機用戶權限)
 

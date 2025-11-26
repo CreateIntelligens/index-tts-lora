@@ -18,6 +18,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from transformers import get_cosine_schedule_with_warmup
+from torch.amp import GradScaler
 
 from indextts.BigVGAN.models import BigVGAN
 from indextts.data_utils import (
@@ -36,10 +37,18 @@ except ImportError:
     logger.warning("⚠️  GPU Manager not available, multi-GPU support disabled")
 
 
+def normalize_state_dict_keys(state_dict: dict) -> dict:
+    """標準化權重名稱，移除 DataParallel/DDP 產生的 module. 前綴。"""
+    if not any(key.startswith("module.") for key in state_dict.keys()):
+        return state_dict
+    return {key.removeprefix("module."): value for key, value in state_dict.items()}
+
+
 def load_UnifiedVoice(gpt_config: DictConfig, gpt_checkpoint_path: str, device: torch.device) -> UnifiedVoice:
     """載入 UnifiedVoice 模型權重。"""
     state_dict = torch.load(gpt_checkpoint_path, map_location=device, weights_only=True)
     state_dict = state_dict["model"] if "model" in state_dict else state_dict
+    state_dict = normalize_state_dict_keys(state_dict)
     model = UnifiedVoice(**gpt_config)
     model.load_state_dict(state_dict, strict=True)
     model.post_init_gpt2_config()
@@ -339,6 +348,12 @@ class Trainer:
         # 設定隨機種子
         self._set_seed(self.config.train.seed)
 
+        # 初始化 GradScaler（會在 _setup_mixed_precision 中設定）
+        self.grad_scaler = None
+
+        # 設定混合精度訓練（細粒度配置）
+        self.train_dtype, self.use_amp = self._setup_mixed_precision()
+
         # 準備目錄和日誌
         self.finetune_dir = self.config.train.finetune_model_dir
         self.checkpoint_dir = os.path.join(self.finetune_dir, "checkpoints")
@@ -366,6 +381,75 @@ class Trainer:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
         logger.info(f"Set random seed to {seed}")
+
+    def _resolve_dtype(self, precision_str: str):
+        """解析精度字串為 torch.dtype"""
+        def supports_fp8():
+            if not torch.cuda.is_available():
+                return False
+            capability = torch.cuda.get_device_capability()
+            compute_capability = capability[0] * 10 + capability[1]
+            return compute_capability >= 89
+
+        if precision_str == "no" or precision_str == "fp32":
+            return torch.float32
+        elif precision_str == "auto":
+            if supports_fp8():
+                return torch.float8_e4m3fn if hasattr(torch, 'float8_e4m3fn') else torch.bfloat16
+            elif torch.cuda.is_bf16_supported():
+                return torch.bfloat16
+            else:
+                return torch.float16
+        elif precision_str == "fp8":
+            if supports_fp8() and hasattr(torch, 'float8_e4m3fn'):
+                return torch.float8_e4m3fn
+            else:
+                logger.warning(f"⚠️  FP8 不支援，退回 BF16")
+                return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        elif precision_str == "bf16":
+            return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        elif precision_str == "fp16":
+            return torch.float16
+        else:
+            logger.warning(f"⚠️  未知精度: {precision_str}，使用 FP32")
+            return torch.float32
+
+    def _setup_mixed_precision(self):
+        """
+        設定混合精度訓練。
+
+        混合精度訓練流程說明：
+        - 資料前處理：FP32（保持數值穩定性）
+        - 前向/反向運算：BF16/FP16/FP8（加速計算、節省顯存）
+        - Loss 計算：FP32（避免數值溢出）
+        - Optimizer state：FP32（Adam/AdamW 內部自動維持 FP32 避免精度累積誤差）
+
+        Returns:
+            Tuple[torch.dtype, bool]: (運算精度, 是否啟用AMP)
+        """
+        mixed_precision = self.config.train.get("mixed_precision", "auto")
+
+        if not torch.cuda.is_available():
+            logger.warning("⚠️  CUDA 不可用，使用 FP32 訓練")
+            return None, False
+
+        # 解析精度字串
+        dtype = self._resolve_dtype(mixed_precision)
+
+        logger.info("🚀 混合精度訓練")
+        logger.info(f"   運算精度: {dtype}")
+
+        # 檢查是否需要 GradScaler（FP16 需要）
+        use_grad_scaler = (dtype == torch.float16)
+
+        if use_grad_scaler:
+            self.grad_scaler = GradScaler()
+            logger.info("   📊 啟用 GradScaler（FP16 防止梯度下溢）")
+        else:
+            self.grad_scaler = None
+
+        logger.info("=" * 50)
+        return dtype, True
 
     def _setup_logging(self):
         """配置 loguru 日誌記錄器。"""
@@ -470,8 +554,23 @@ class Trainer:
         self.scheduler = scheduler
         logger.info("Optimizer (LoRA+) and Scheduler (CosineAnnealingWithWarmup) created.")
 
-    def _train_step(self, data_batch: tuple) -> Tuple[torch.Tensor, torch.Tensor, dict]:  # 修正：應該返回三個值
-        """執行單個訓練步驟（前向和後向傳播）。"""
+    def _train_step(self, data_batch: tuple) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """
+        執行單個訓練步驟（前向和後向傳播）。
+        
+        混合精度處理說明：
+        - autocast 區塊內：前向運算使用低精度 (BF16/FP16)
+        - Loss 計算：自動提升為 FP32
+        - 梯度計算：與前向精度一致
+        - FP16 模式：使用 GradScaler 防止梯度下溢
+        
+        Args:
+            data_batch: 包含 mel_spec, mel_codes, text_ids, conditions, 
+                       speaker_ids, mel_lengths, codes_lengths, text_lengths
+        
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, dict]: (text_loss, mel_loss, mel_accuracy)
+        """
         self.model.train()
         # 獲取實際模型（處理 DataParallel 包裝）
         actual_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
@@ -479,18 +578,38 @@ class Trainer:
     
         # Unpack data_batch: mel_spec, mel_codes, text_ids, conditions, speaker_ids, mel_lengths, codes_lengths, text_lengths
         mel_spec, mel_codes, text_ids, conditions, speaker_ids, mel_lengths, codes_lengths, text_lengths = data_batch
-        outputs = forward_UnifiedVoice(
-            self.model,
-            mel_spec,
-            mel_codes,
-            text_ids,
-            mel_lengths,
-            codes_lengths,
-            text_lengths,
-            speaker_ids=speaker_ids,  # 確保這一行存在
-            output_loss=True,
-            output_logits=True,
-        )
+
+        # 使用混合精度訓練
+        if self.use_amp and self.train_dtype:
+            with torch.autocast(device_type='cuda', dtype=self.train_dtype):
+                outputs = forward_UnifiedVoice(
+                    self.model,
+                    mel_spec,
+                    mel_codes,
+                    text_ids,
+                    mel_lengths,
+                    codes_lengths,
+                    text_lengths,
+                    speaker_ids=speaker_ids,
+                    output_loss=True,
+                    output_logits=True,
+                )
+        else:
+            # FP32 訓練
+            outputs = forward_UnifiedVoice(
+                self.model,
+                mel_spec,
+                mel_codes,
+                text_ids,
+                mel_lengths,
+                codes_lengths,
+                text_lengths,
+                speaker_ids=speaker_ids,
+                output_loss=True,
+                output_logits=True,
+            )
+
+        # Loss 會自動轉為 FP32（PyTorch autocast 特性）
         loss_text, loss_mel = outputs["loss"]
         mel_accuracy = outputs.get("mel_accuracy", {"acc_1": 0.0, "acc_10": 0.0, "acc_20": 0.0})
         return loss_text, loss_mel, mel_accuracy
@@ -517,19 +636,35 @@ class Trainer:
 
             # 正確解包新格式：mel_spec, mel_codes, text_ids, conditions, speaker_ids, mel_lengths, codes_lengths, text_lengths
             mel_spec, mel_codes, text_ids, conditions, speaker_ids, mel_lengths, codes_lengths, text_lengths = data_batch
-            
-            outputs = forward_UnifiedVoice(
-                self.model,
-                mel_spec,
-                mel_codes,
-                text_ids,
-                mel_lengths,
-                codes_lengths,
-                text_lengths,
-                speaker_ids=speaker_ids,  # 新增這一行
-                output_loss=True,
-                output_logits=True,
-            )
+
+            # 使用混合精度驗證
+            if self.use_amp and self.train_dtype:
+                with torch.autocast(device_type='cuda', dtype=self.train_dtype):
+                    outputs = forward_UnifiedVoice(
+                        self.model,
+                        mel_spec,
+                        mel_codes,
+                        text_ids,
+                        mel_lengths,
+                        codes_lengths,
+                        text_lengths,
+                        speaker_ids=speaker_ids,
+                        output_loss=True,
+                        output_logits=True,
+                    )
+            else:
+                outputs = forward_UnifiedVoice(
+                    self.model,
+                    mel_spec,
+                    mel_codes,
+                    text_ids,
+                    mel_lengths,
+                    codes_lengths,
+                    text_lengths,
+                    speaker_ids=speaker_ids,
+                    output_loss=True,
+                    output_logits=True,
+                )
             
             loss_text, loss_mel = outputs["loss"]
             batch_text_tokens = text_lengths.sum().item()
@@ -670,10 +805,24 @@ class Trainer:
                     continue
 
                 # ------------------ Optimisation Step ------------------
+                # 混合精度梯度處理：
+                # - BF16: 直接 backward，不需要 scaling
+                # - FP16: 使用 GradScaler 防止梯度下溢
                 self.optimizer.zero_grad()
-                weighted_loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), train_cfg.max_grad_norm)
-                self.optimizer.step()
+                
+                if self.grad_scaler is not None:
+                    # FP16 模式：使用 GradScaler
+                    self.grad_scaler.scale(weighted_loss).backward()
+                    self.grad_scaler.unscale_(self.optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), train_cfg.max_grad_norm)
+                    self.grad_scaler.step(self.optimizer)
+                    self.grad_scaler.update()
+                else:
+                    # BF16/FP32 模式：直接 backward
+                    weighted_loss.backward()
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), train_cfg.max_grad_norm)
+                    self.optimizer.step()
+                
                 self.scheduler.step()
                 self.update_steps += 1
 

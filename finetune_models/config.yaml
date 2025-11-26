@@ -1,3 +1,41 @@
+# =============================================================================
+# Index-TTS LoRA 微調統一配置文件
+# 此文件整合了工作流配置和模型訓練配置
+# =============================================================================
+
+# === 工作流配置（prepare/extract 階段使用）===
+workflow:
+  # 路徑配置
+  paths:
+    data_source_dir: "data0"                           # 原始音頻資料目錄
+    audio_list_dir: "finetune_data/audio_list"         # audio_list 輸出目錄
+    processed_data_dir: "finetune_data/processed_data" # 處理後的特徵資料目錄
+    log_dir: "logs"                                    # 日誌目錄
+
+  # Prepare 配置
+  prepare:
+    split_size: 100000    # 自動分割大小（每個 part 的行數）
+                          # 建議: 50000-100000（數值越小，part 越多，適合更多 GPU）
+                          # 設為 0 則不分割
+
+  # Extract 配置
+  extract:
+    batch_size: 16        # 批次大小（建議: 16-64，根據 GPU 記憶體調整）
+    num_workers: 8        # DataLoader worker 數量（建議: 8-16）
+    # GPU 配置（可選）
+    # gpus: "0,1,2,3"     # 指定使用的 GPU 編號（留空或註解則使用默認 GPU 0-3）
+                          # 範例: gpus: "4,5,6,7"  (使用 GPU 4-7)
+                          # 範例: gpus: "0"        (只用 GPU 0)
+
+  # Medoid 計算配置
+  medoid:
+    batch_size: 10000     # 每次計算多少行（建議 500-2000）
+    chunk_size: 20000     # 每個列分塊大小（建議 1000-3000）
+                          # GPU 記憶體使用 ≈ batch_size × chunk_size × 4 bytes
+                          # 例如 1000×2000 ≈ 8MB（很安全）
+                          # 數值越大越快，但需要更多 GPU 記憶體
+
+# === 模型配置 ===
 dataset:
     bpe_model: bpe.model
     sample_rate: 24000
@@ -124,6 +162,11 @@ train:
     early_stopping_patience: 1
     max_steps_per_epoch: 150 # 每個 epoch 最大訓練樣本數
     data_path: "finetune_data/processed_data"
+
+    # 混合精度訓練設定
+    mixed_precision: "auto"  # 訓練運算精度
+                             # 選項: "auto", "fp8", "bf16", "fp16", "fp32"
+                             # 只影響前向/反向運算，權重和優化器永遠保持 FP32
 
     optimizer:
         learning_rate: 5.0e-5

@@ -28,3 +28,5 @@ WeTextProcessing; platform_machine != "Darwin"
 wetext; platform_system == "Darwin"
 #
 deepspeed
+# 量化推理支援 (可選)
+bitsandbytes>=0.43.0
