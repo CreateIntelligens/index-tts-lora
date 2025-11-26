@@ -109,6 +109,34 @@ fi
 echo ""
 echo "📦 安裝 indextts 套件..."
 
+# 等待 GPU 初始化
+echo "⏳ 等待 GPU 初始化..."
+for i in {1..10}; do
+    if nvidia-smi >/dev/null 2>&1; then
+        echo "✅ GPU 已就緒"
+        break
+    fi
+    echo "   等待中... ($i/10)"
+    sleep 2
+done
+
+# 驗證 PyTorch 能看到 GPU
+if python3 -c "import torch; assert torch.cuda.is_available(), 'CUDA not available'" 2>/dev/null; then
+    echo "✅ PyTorch CUDA 已就緒"
+else
+    echo "⚠️  警告: PyTorch 無法檢測到 CUDA，編譯可能失敗"
+fi
+
+# 自動檢測 GPU 架構並設定 TORCH_CUDA_ARCH_LIST
+GPU_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1)
+if [ -n "$GPU_ARCH" ]; then
+    echo "🎯 檢測到 GPU 架構: $GPU_ARCH"
+    export TORCH_CUDA_ARCH_LIST="$GPU_ARCH"
+else
+    echo "⚠️  無法自動檢測 GPU 架構，使用預設值"
+    export TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6 8.9 9.0"
+fi
+
 # 安裝當前專案 (editable mode)
 pip install -e . --no-build-isolation -q
 

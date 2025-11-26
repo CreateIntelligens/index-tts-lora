@@ -85,12 +85,30 @@ def load(force_rebuild=False):
     if not cpp_extension.CUDA_HOME:
         raise RuntimeError(cpp_extension.CUDA_NOT_FOUND_MESSAGE)
     cpp_extension.verify_ninja_availability()
-    # Check if cuda 11 is installed for compute capability 8.0
+    # 動態檢測 GPU 架構
     cc_flag = []
     _, bare_metal_major, _ = _get_cuda_bare_metal_version(cpp_extension.CUDA_HOME)
     if int(bare_metal_major) >= 11:
-        cc_flag.append("-gencode")
-        cc_flag.append("arch=compute_80,code=sm_80")
+        # 自動檢測當前 GPU 架構
+        try:
+            import subprocess
+            gpu_arch = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+                universal_newlines=True
+            ).strip().split('\n')[0].replace('.', '')
+
+            if gpu_arch:
+                print(f"🎯 檢測到 GPU 計算能力: {gpu_arch[:1]}.{gpu_arch[1:]}")
+                cc_flag.append("-gencode")
+                cc_flag.append(f"arch=compute_{gpu_arch},code=sm_{gpu_arch}")
+            else:
+                # 預設使用 8.6 (RTX 3090/A6000)
+                cc_flag.append("-gencode")
+                cc_flag.append("arch=compute_86,code=sm_86")
+        except Exception as e:
+            print(f"⚠️  無法檢測 GPU 架構: {e}，使用預設 sm_86")
+            cc_flag.append("-gencode")
+            cc_flag.append("arch=compute_86,code=sm_86")
 
     # Helper function to build the kernels.
     def _cpp_extention_load_helper(name, sources, extra_cuda_flags):
