@@ -500,7 +500,9 @@ class Trainer:
         # 獲取實際模型（處理 DataParallel 包裝）
         actual_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
 
-        for speaker_id, condition in self.speaker_conditions.items():
+        from tqdm import tqdm
+        pbar = tqdm(self.speaker_conditions.items(), desc="Register speaker conditions", ncols=100)
+        for speaker_id, condition in pbar:
             # 驗證和調整形狀
             if condition.ndim == 2:  # (32, dim) -> (1, 32, dim)
                 condition = condition.unsqueeze(0)
@@ -515,7 +517,8 @@ class Trainer:
             actual_model.register_parameter(param_name, param)
             self.speaker_mean_conditions[speaker_id] = param
 
-            logger.debug(f"Registered parameter {param_name} with shape {param.shape}")
+            pbar.set_postfix({"last": speaker_id})
+        pbar.close()
 
         logger.info(f"Loaded and registered {len(self.speaker_mean_conditions)} speaker conditions.")
 

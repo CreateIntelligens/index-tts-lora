@@ -2,6 +2,77 @@
 
 set -e
 
+# 修復用戶 HOME 目錄權限（必須在最開始執行）
+CURRENT_UID=$(id -u)
+USER_ID=${UID:-1000}
+GROUP_ID=${GID:-1000}
+
+# 只有在以 root 身份運行時才修復權限
+if [ "$CURRENT_UID" = "0" ]; then
+    # 建立用戶的 .cache 和 .local 目錄
+    mkdir -p /root/.cache /root/.local
+
+    if [ "$USER_ID" != "0" ]; then
+        # 如果有指定非 root 用戶，建立對應的 home 目錄
+        USER_HOME="/home/user_${USER_ID}"
+        mkdir -p "$USER_HOME/.cache" "$USER_HOME/.local"
+
+        # 建立符號連結讓 root 的 .cache 和 .local 指向用戶目錄
+        # 這樣 pip install 時會寫入正確位置
+        rm -rf /root/.cache /root/.local
+        ln -s "$USER_HOME/.cache" /root/.cache
+        ln -s "$USER_HOME/.local" /root/.local
+
+        # 設定權限
+        chown -R $USER_ID:$GROUP_ID "$USER_HOME"
+    fi
+else
+    # 非 root 用戶，確保自己的 HOME 目錄存在
+    mkdir -p "$HOME/.cache" "$HOME/.local" 2>/dev/null || true
+fi
+
+GPU_HEALTHCHECK_CMD="/bin/bash /gpu-healthcheck.sh"
+
+wait_for_gpu() {
+    local attempts="${GPU_HEALTHCHECK_RETRIES:-10}"
+    local sleep_seconds="${GPU_HEALTHCHECK_SLEEP:-2}"
+
+    echo "⏳ 等待 GPU 初始化..."
+    for i in $(seq 1 "$attempts"); do
+        if $GPU_HEALTHCHECK_CMD >/dev/null 2>&1; then
+            echo "✅ GPU 健康檢查通過"
+            return 0
+        fi
+        echo "   等待中... ($i/$attempts)"
+        sleep "$sleep_seconds"
+    done
+
+    echo "❌ 無法檢測到 GPU，容器將退出以觸發重啟"
+    return 1
+}
+
+start_gpu_watchdog() {
+    local enabled="${GPU_WATCHDOG_ENABLED:-1}"
+    local interval="${GPU_WATCHDOG_INTERVAL:-60}"
+
+    if [ "$enabled" = "0" ]; then
+        echo "🔕 已停用 GPU watchdog (GPU_WATCHDOG_ENABLED=0)"
+        return
+    fi
+
+    echo "🛡️  啟動 GPU watchdog，每 ${interval}s 檢查一次"
+    (
+        while true; do
+            if ! $GPU_HEALTHCHECK_CMD >/dev/null 2>&1; then
+                echo "❌ GPU 健康檢查失敗，容器將退出以觸發重啟"
+                kill 1
+                exit 1
+            fi
+            sleep "$interval"
+        done
+    ) &
+}
+
 echo "🔧 檢查並修復目錄權限..."
 
 # 切換到工作目錄
@@ -109,22 +180,8 @@ fi
 echo ""
 echo "📦 安裝 indextts 套件..."
 
-# 等待 GPU 初始化
-echo "⏳ 等待 GPU 初始化..."
-for i in {1..10}; do
-    if nvidia-smi >/dev/null 2>&1; then
-        echo "✅ GPU 已就緒"
-        break
-    fi
-    echo "   等待中... ($i/10)"
-    sleep 2
-done
-
-# 驗證 PyTorch 能看到 GPU
-if python3 -c "import torch; assert torch.cuda.is_available(), 'CUDA not available'" 2>/dev/null; then
-    echo "✅ PyTorch CUDA 已就緒"
-else
-    echo "⚠️  警告: PyTorch 無法檢測到 CUDA，編譯可能失敗"
+if ! wait_for_gpu; then
+    exit 1
 fi
 
 # 自動檢測 GPU 架構並設定 TORCH_CUDA_ARCH_LIST
@@ -141,6 +198,7 @@ fi
 pip install -e . --no-build-isolation -q
 
 echo "✅ indextts 套件安裝完成!"
+start_gpu_watchdog
 echo ""
 echo "🚀 啟動服務..."
 echo ""

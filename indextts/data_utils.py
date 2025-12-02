@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+from pathlib import Path
 from typing import List, Tuple
 
 import numpy as np
@@ -11,6 +12,27 @@ from torch.utils.data import DataLoader, Dataset
 
 # 匯入與infer.py相同的文字處理類
 from indextts.utils.front import TextNormalizer, TextTokenizer
+
+
+def _load_manifest_batch(batch):
+    """批次載入多個 manifest 檔案（減少進程啟動開銷）"""
+    all_items = []
+    total_filtered = 0
+    for manifest_file, speaker_id in batch:
+        try:
+            with open(manifest_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        item = json.loads(line.strip())
+                        duration = item.get("duration", 0)
+                        if duration > 20 or duration < 1:
+                            total_filtered += 1
+                            continue
+                        item['speaker_id'] = speaker_id
+                        all_items.append(item)
+        except Exception as e:
+            logger.warning(f"Error loading {manifest_file}: {e}")
+    return all_items, total_filtered
 
 
 class FinetuneDataset(Dataset):
@@ -27,39 +49,82 @@ class FinetuneDataset(Dataset):
         """
         super().__init__()
         self.config = config
+        self.bpe_path = bpe_path
         self.data = []
-        
-        # 使用與infer.py完全相同的文字處理器
+        self.index = []
+        self.manifest_files = list(dict.fromkeys(manifest_files))  # 去重，避免同一檔案被多個 speaker 指到而重複掃描
+        # speaker_ids 不再用於賦值，以 audio path 推回 speaker_id；此處僅保留長度一致以防後續需要
+        if speaker_ids is None:
+            self.manifest_speakers = ["unknown"] * len(self.manifest_files)
+        else:
+            # 若重複檔案只保留第一個對應的 speaker_id
+            seen = set()
+            filtered_speakers = []
+            for mf, sid in zip(manifest_files, speaker_ids):
+                if mf in seen:
+                    continue
+                seen.add(mf)
+                filtered_speakers.append(sid)
+            # 對齊長度
+            if len(filtered_speakers) < len(self.manifest_files):
+                filtered_speakers += ["unknown"] * (len(self.manifest_files) - len(filtered_speakers))
+            self.manifest_speakers = filtered_speakers[:len(self.manifest_files)]
+        self.use_lazy_metadata = True
+        if hasattr(config, "train") and isinstance(config.train, DictConfig) and "lazy_load_metadata" in config.train:
+            self.use_lazy_metadata = bool(config.train.lazy_load_metadata)
+
+        # 載入所有說話人的資料（使用多線程加速 IO）
+        from tqdm import tqdm
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # 取得當前進程的 rank（用於多 GPU 訓練）
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        dataset_type = "train" if "train" in str(self.manifest_files[0]) else "valid"
+
+        if self.use_lazy_metadata:
+            if rank == 0:
+                print(f">> [Rank 0] 懶載入模式：掃描 {len(self.manifest_files)} 個 manifest 的 {dataset_type} metadata（不常駐記憶體）...")
+            filtered_count, total_samples = self._build_lazy_index(dataset_type, rank)
+        else:
+            # 只在 rank 0 載入完整 metadata，然後廣播給其他 rank
+            if rank == 0:
+                print(f">> [Rank 0] 開始載入 {len(self.manifest_files)} 個 manifest 的 {dataset_type} metadata...")
+            else:
+                print(f">> [Rank {rank}] 等待 Rank 0 載入 {dataset_type} metadata...")
+            filtered_count, total_samples = self._load_all_metadata(dataset_type, rank)
+
+        logger.info(
+            f"✓ 準備 {total_samples} 個樣本 (來自 {len(self.manifest_files)} 個 speaker，"
+            f"模式: {'lazy' if self.use_lazy_metadata else 'in-memory'})" +
+            (f"，過濾掉 {filtered_count} 個不符合時長的樣本" if filtered_count > 0 else "")
+        )
+
+        # metadata 載入完成後，才初始化 tokenizer（只載入一次）
+        print(">> 初始化 TextNormalizer 和 BPE tokenizer...")
         self.normalizer = TextNormalizer()
         self.normalizer.load()
         self.tokenizer = TextTokenizer(bpe_path, self.normalizer)
-        
-        print(">> TextNormalizer loaded for training")
-        print(f">> BPE model loaded from: {bpe_path}")
-        
-        # 載入所有說話人的資料
-        for manifest_file, speaker_id in zip(manifest_files, speaker_ids):
-            logger.info(f"Loading data from manifest: {manifest_file} for speaker: {speaker_id}")
-            with open(manifest_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.strip():
-                        # 根據音訊時長過濾資料
-                        item = json.loads(line.strip())
-
-                        duration = item.get("duration", 0)
-                        if duration > 20 or duration < 1:
-                            continue
-
-                        item['speaker_id'] = speaker_id  # 新增說話人ID
-                        self.data.append(item)
-        
-        logger.info(f"Loaded {len(self.data)} samples from {len(manifest_files)} speakers.")
+        print(">> TextNormalizer 和 BPE model 載入完成")
 
     def __len__(self):
-        return len(self.data)
+        return len(self.index) if self.use_lazy_metadata else len(self.data)
 
     def __getitem__(self, index):
-        item = self.data[index]
+        if self.use_lazy_metadata:
+            manifest_idx, offset = self.index[index]
+            manifest_file = self.manifest_files[manifest_idx]
+            with open(manifest_file, "r", encoding="utf-8") as f:
+                f.seek(offset)
+                line = f.readline()
+            item = json.loads(line.strip())
+        else:
+            item = self.data[index]
+        
+        # 由 audio 路徑推回 speaker_id（drama_name + character_id）
+        if "speaker_id" not in item:
+            item["speaker_id"] = self._infer_speaker_id(item.get("audio", ""))
         
         text = item["text"]
         codes_path = item.get("codes", None)
@@ -83,6 +148,181 @@ class FinetuneDataset(Dataset):
         condition = torch.FloatTensor(condition_npy) if condition_npy is not None else None
 
         return (mel_spec, mel_codes, text_ids, condition, speaker_id)
+
+    def _infer_speaker_id(self, audio_path: str) -> str:
+        """從 audio 路徑推回 speaker_id，用於共用 manifest 的情況。"""
+        try:
+            parts = Path(audio_path).parts
+            data_idx = parts.index("data") if "data" in parts else -1
+            if data_idx >= 0 and len(parts) > data_idx + 2:
+                drama_name = parts[data_idx + 1]
+                character_id = parts[data_idx + 2]
+                return f"{drama_name}_{character_id}"
+        except Exception:
+            pass
+        return "unknown"
+
+    def _build_lazy_index(self, dataset_type: str, rank: int):
+        """只建立 offset 索引，不把 metadata 常駐記憶體。"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from tqdm import tqdm
+        import multiprocessing
+        import torch.distributed as dist
+
+        def scan_manifest(manifest_idx: int, manifest_file: str):
+            """回傳該 manifest 的所有有效 offset。"""
+            offsets = []
+            filtered = 0
+            try:
+                with open(manifest_file, "r", encoding="utf-8") as f:
+                    while True:
+                        offset = f.tell()
+                        line = f.readline()
+                        if not line:
+                            break
+                        if not line.strip():
+                            continue
+                        item = json.loads(line.strip())
+                        duration = item.get("duration", 0)
+                        if duration > 20 or duration < 1:
+                            filtered += 1
+                            continue
+                        offsets.append((manifest_idx, offset))
+            except Exception as e:
+                return manifest_idx, offsets, filtered, f"Error loading {manifest_file}: {e}"
+            return manifest_idx, offsets, filtered, None
+
+        max_workers = min(32, (multiprocessing.cpu_count() or 1) * 2)
+        entries_per_manifest = [None] * len(self.manifest_files)
+        filtered_count = 0
+        total_samples = 0
+        errors = []
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(scan_manifest, idx, mf)
+                for idx, mf in enumerate(self.manifest_files)
+            ]
+            pbar = tqdm(total=len(futures),
+                        desc=f"[Rank {rank}] 掃描 {dataset_type} metadata (lazy)",
+                        unit="spk", ncols=100, postfix={"samples": 0})
+            for future in as_completed(futures):
+                manifest_idx, offsets, filtered, err = future.result()
+                entries_per_manifest[manifest_idx] = offsets
+                filtered_count += filtered
+                total_samples += len(offsets)
+                if err:
+                    errors.append(err)
+                pbar.update(1)
+                pbar.set_postfix({"samples": total_samples})
+            pbar.close()
+
+        # 維持 manifest 順序展平成全域索引
+        for offsets in entries_per_manifest:
+            if offsets:
+                self.index.extend(offsets)
+
+        for error in errors:
+            logger.warning(error)
+
+        # 確保所有 rank 都完成掃描
+        if dist.is_initialized():
+            dist.barrier()
+
+        return filtered_count, total_samples
+
+    def _load_all_metadata(self, dataset_type: str, rank: int):
+        """沿用原本的完整載入流程（占記憶體）。"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from tqdm import tqdm
+        import torch.distributed as dist
+
+        def load_single_manifest(manifest_file, speaker_id):
+            """載入單個 manifest 檔案"""
+            items = []
+            filtered = 0
+            error_msg = None
+            try:
+                with open(manifest_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.strip():
+                            item = json.loads(line.strip())
+                            duration = item.get("duration", 0)
+                            if duration > 20 or duration < 1:
+                                filtered += 1
+                                continue
+                            item['speaker_id'] = self._infer_speaker_id(item.get("audio", ""))
+                            items.append(item)
+            except Exception as e:
+                error_msg = f"Error loading {manifest_file}: {e}"
+            return items, filtered, error_msg
+
+        if rank == 0:
+            filtered_count = 0
+            max_workers = min(64, len(self.manifest_files))
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(load_single_manifest, mf, sid): (mf, sid)
+                    for mf, sid in zip(self.manifest_files, self.manifest_speakers)
+                }
+
+                errors = []
+                all_items = []
+                pbar = tqdm(total=len(futures), desc=f"[Rank 0] 載入 {dataset_type} metadata",
+                           unit="spk", ncols=100, postfix={"samples": 0})
+                for future in as_completed(futures):
+                    items, filtered, error_msg = future.result()
+                    if error_msg:
+                        errors.append(error_msg)
+                    all_items.append(items)
+                    filtered_count += filtered
+                    pbar.update(1)
+                    pbar.set_postfix({"samples": sum(len(x) for x in all_items)})
+                pbar.close()
+
+                total_samples = sum(len(x) for x in all_items)
+                print(f">> [Rank 0] 合併 {total_samples:,} 個 {dataset_type} 樣本...")
+
+                self.data = []
+                for items in all_items:
+                    self.data.extend(items)
+
+                del all_items
+                import gc
+                gc.collect()
+
+                for error in errors:
+                    logger.warning(error)
+
+            print(f">> [Rank 0] 廣播 {len(self.data)} 個樣本給其他 rank...")
+        else:
+            self.data = None
+            filtered_count = 0
+
+        # 廣播給其他 rank（使用 pickle 序列化）
+        if dist.is_initialized():
+            import pickle
+            if rank == 0:
+                data_bytes = pickle.dumps(self.data)
+                data_size = len(data_bytes)
+                size_tensor = torch.tensor([data_size], dtype=torch.long)
+                dist.broadcast(size_tensor, src=0)
+                data_tensor = torch.ByteTensor(list(data_bytes))
+                dist.broadcast(data_tensor, src=0)
+                print(f">> [Rank 0] 已廣播 {data_size/1024/1024:.1f} MB 資料")
+            else:
+                size_tensor = torch.tensor([0], dtype=torch.long)
+                dist.broadcast(size_tensor, src=0)
+                data_size = size_tensor.item()
+                data_tensor = torch.ByteTensor(data_size)
+                dist.broadcast(data_tensor, src=0)
+                data_bytes = bytes(data_tensor.tolist())
+                self.data = pickle.loads(data_bytes)
+                print(f">> [Rank {rank}] 已接收 {len(self.data)} 個樣本")
+
+        total_samples = len(self.data)
+        return filtered_count, total_samples
 
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -201,21 +441,47 @@ def load_finetune_datasets(config: DictConfig, bpe_path: str) -> Tuple[Dataset, 
     train_manifest_files = []
     valid_manifest_files = []
     speaker_ids = []
-    
-    # 收集所有說話人的訓練和驗證資料檔案
-    for speaker_info in speaker_info_list:
-        speaker_id = speaker_info['speaker']
 
+    # 收集所有說話人的訓練和驗證資料檔案
+    from tqdm import tqdm
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import multiprocessing
+
+    logger.info(f"載入 {len(speaker_info_list)} 個 speaker 的資料...")
+
+    def check_speaker_files(speaker_info):
+        """檢查單個 speaker 的檔案是否存在"""
+        speaker_id = speaker_info['speaker']
         train_file = speaker_info['train_jsonl']
         valid_file = speaker_info['valid_jsonl']
-        
-        if os.path.exists(train_file) and os.path.exists(valid_file):
-            train_manifest_files.append(train_file)
-            valid_manifest_files.append(valid_file)
-            speaker_ids.append(speaker_id)
-            logger.info(f"Added speaker {speaker_id} with data from {train_file} and {valid_file}")
-        else:
-            logger.warning(f"Missing metadata files for speaker {speaker_id}")
+
+        try:
+            if os.access(train_file, os.R_OK) and os.access(valid_file, os.R_OK):
+                return (train_file, valid_file, speaker_id, True)
+            else:
+                return (None, None, speaker_id, False)
+        except:
+            return (None, None, speaker_id, False)
+
+    missing_count = 0
+    # 使用多線程並行檢查（IO bound，用線程比進程快）
+    num_workers = min(32, multiprocessing.cpu_count() * 2)  # 最多 32 個 worker
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(check_speaker_files, info) for info in speaker_info_list]
+
+        for future in tqdm(as_completed(futures), total=len(speaker_info_list),
+                          desc="載入 speaker 資料", unit="speaker", ncols=80):
+            train_file, valid_file, speaker_id, success = future.result()
+            if success:
+                train_manifest_files.append(train_file)
+                valid_manifest_files.append(valid_file)
+                speaker_ids.append(speaker_id)
+            else:
+                missing_count += 1
+
+    logger.info(f"✓ 成功載入 {len(speaker_ids)} 個 speaker" +
+                (f" (跳過 {missing_count} 個缺失檔案)" if missing_count > 0 else ""))
     
     # 建立資料集
     train_dataset = FinetuneDataset(train_manifest_files, bpe_path, speaker_ids, config)

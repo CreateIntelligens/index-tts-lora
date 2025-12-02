@@ -7,7 +7,7 @@
 workflow:
   # 路徑配置
   paths:
-    data_source_dir: "data0"                           # 原始音頻資料目錄
+    data_source_dir: "data"                           # 原始音頻資料目錄
     audio_list_dir: "finetune_data/audio_list"         # audio_list 輸出目錄
     processed_data_dir: "finetune_data/processed_data" # 處理後的特徵資料目錄
     log_dir: "logs"                                    # 日誌目錄
@@ -151,10 +151,13 @@ train:
     epochs: 15
 
     # === GPU 使用率優化參數 - 針對 A100 80GB 優化 ===
-    batch_size: 64              # 🚀 從 16 → 64，充分利用 80GB
-    valid_batch_size: 128       # 驗證時可以更大
-    num_workers: 8              # 減少 workers（16 太多了）
-    valid_num_workers: 4
+    batch_size: 128             # 每 GPU 的 batch 大小
+    valid_batch_size: 256       # 驗證批次
+    num_workers: 2              # DataLoader worker 數（DDP 每個 rank 各自）
+    valid_num_workers: 2
+    prefetch_factor: 2          # 每個 worker 預先拉 2 個 batch
+    persistent_workers: true    # 保持 worker 避免頻繁啟動開銷
+    lazy_load_metadata: true     # 懶載入 metadata，只存 offset 索引以降低常駐記憶體
 
     gradient_accumulation_steps: 2  # 從 8 → 2，有效 batch = 64×2 = 128
     max_grad_norm: 1.0
@@ -163,10 +166,19 @@ train:
     max_steps_per_epoch: 150 # 每個 epoch 最大訓練樣本數
     data_path: "finetune_data/processed_data"
 
-    # 混合精度訓練設定
-    mixed_precision: "auto"  # 訓練運算精度
-                             # 選項: "auto", "fp8", "bf16", "fp16", "fp32"
-                             # 只影響前向/反向運算，權重和優化器永遠保持 FP32
+    # =========================================================================
+    # 混合精度訓練 (PyTorch AMP)
+    # =========================================================================
+    # 說明: 前向/反向用低精度（快）→ 權重更新用 FP32（準）→ 自動完成
+    #
+    # 選項: "auto" | "bf16" | "fp16" | "fp8" | "fp32"
+    #   - "auto" : 自動選擇（H100→FP8, A100/RTX30/40→BF16, 舊GPU→FP16）
+    #   - "fp8"  : H100 專用，最快（需 PyTorch 2.1+）
+    #   - "bf16" : A100/RTX30/40，穩定快速
+    #   - "fp16" : 舊 GPU 兼容
+    #   - "fp32" : 不使用混合精度（慢，任何 GPU 都可用）
+    #
+    mixed_precision: "auto"  # 推薦 auto，自動適應硬體
 
     optimizer:
         learning_rate: 5.0e-5
@@ -188,3 +200,18 @@ dvae_checkpoint: dvae.pth
 gpt_checkpoint: gpt.pth
 bigvgan_checkpoint: bigvgan_generator.pth
 version: 1.5
+
+# =============================================================================
+# 推理精度配置（可選）
+# =============================================================================
+# 優先順序: config_inference.yaml > 此區塊 > is_fp16 參數
+# 詳細說明請參考: PRECISION.md
+#
+inference:
+  gpt: "bf16"        # bf16 | fp16 | fp32
+  vocoder: "bf16"
+
+  quantization:      # 省顯存模式
+    enabled: false
+    weight_dtype: "int8"   # int8（省75%）| int4（省87.5%）
+    compute_dtype: "bf16"

@@ -173,13 +173,21 @@ class DDPTrainer:
 
         # 註冊說話人條件
         self.speaker_mean_conditions = {}
-        for speaker_id, condition in self.speaker_conditions.items():
+        from tqdm import tqdm
+        iterator = self.speaker_conditions.items()
+        if self.is_main_process:
+            iterator = tqdm(iterator, desc="Register speaker conditions", ncols=100)
+        for speaker_id, condition in iterator:
             if condition.ndim == 2:
                 condition = condition.unsqueeze(0)
             param = torch.nn.Parameter(condition.to(self.device), requires_grad=True)
             param_name = f"mean_condition_{speaker_id}"
             self.model.module.register_parameter(param_name, param)
             self.speaker_mean_conditions[speaker_id] = param
+            if self.is_main_process and hasattr(iterator, "set_postfix"):
+                iterator.set_postfix({"last": speaker_id})
+        if self.is_main_process and hasattr(iterator, "close"):
+            iterator.close()
 
         if self.is_main_process:
             logger.info(f"Loaded {len(self.speaker_mean_conditions)} speaker conditions")

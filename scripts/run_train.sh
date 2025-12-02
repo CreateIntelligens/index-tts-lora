@@ -32,15 +32,21 @@ train_model() {
 
     check_container
 
-    # 自動檢測 GPU 數量
+    # 建立 log 目錄
+    LOG_DIR="logs/train_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$LOG_DIR"
+    LOG_FILE="$LOG_DIR/train.log"
+    print_info "訓練 log 將儲存至: $LOG_FILE"
+
+    # 自動檢測 GPU 數量（使用 PyTorch，尊重 CUDA_VISIBLE_DEVICES）
     if [ -z "$num_gpus" ]; then
         if [ "$USE_DOCKER" -eq 1 ]; then
-            num_gpus=$(docker compose exec index-tts-lora nvidia-smi --list-gpus 2>/dev/null | wc -l)
+            num_gpus=$(docker compose exec index-tts-lora python3 -c "import torch; print(torch.cuda.device_count())" 2>/dev/null)
         else
-            num_gpus=$(nvidia-smi --list-gpus 2>/dev/null | wc -l)
+            num_gpus=$(python3 -c "import torch; print(torch.cuda.device_count())" 2>/dev/null)
         fi
 
-        if [ "$num_gpus" -eq 0 ]; then
+        if [ -z "$num_gpus" ] || [ "$num_gpus" -eq 0 ]; then
             print_error "找不到可用的 GPU"
             exit 1
         fi
@@ -64,26 +70,37 @@ train_model() {
             docker compose exec index-tts-lora \
                 python3 -m torch.distributed.run \
                 --nproc_per_node="$num_gpus" \
-                train.py
+                train_ddp.py 2>&1 | tee "$LOG_FILE"
         else
             python3 -m torch.distributed.run \
                 --nproc_per_node="$num_gpus" \
-                train.py
+                train_ddp.py 2>&1 | tee "$LOG_FILE"
         fi
     else
         print_info "使用 DataParallel 訓練"
 
         if [ "$USE_DOCKER" -eq 1 ]; then
-            docker compose exec index-tts-lora python3 train.py
+            docker compose exec index-tts-lora python3 train.py 2>&1 | tee "$LOG_FILE"
         else
-            python3 train.py
+            python3 train.py 2>&1 | tee "$LOG_FILE"
         fi
+    fi
+
+    # 修復 log 檔案權限
+    if [ -f "$LOG_FILE" ]; then
+        # 取得宿主機用戶 UID/GID
+        HOST_UID=$(stat -c '%u' docker-compose.yml 2>/dev/null || echo "1000")
+        HOST_GID=$(stat -c '%g' docker-compose.yml 2>/dev/null || echo "1000")
+        chown $HOST_UID:$HOST_GID "$LOG_FILE" 2>/dev/null || true
+        chown $HOST_UID:$HOST_GID "$LOG_DIR" 2>/dev/null || true
     fi
 
     if [ $? -eq 0 ]; then
         print_success "訓練完成！"
+        print_info "Log 檔案: $LOG_FILE"
     else
         print_error "訓練失敗！"
+        print_info "Log 檔案: $LOG_FILE"
         exit 1
     fi
 }

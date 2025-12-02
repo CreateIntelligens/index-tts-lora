@@ -1,93 +1,27 @@
-# ============================================
-# Docker Build 時排除的文件
-# (不影響 volume 掛載，只影響 COPY 命令)
-# ============================================
-
-# Git
 .git
 .gitignore
-.gitattributes
-
-# Python 編譯檔案
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# Virtual environments
-venv/
+.pytest_cache/
+.mypy_cache/
+.venv/
 env/
-ENV/
-.venv
+venv/
+*.pyc
+*.pyo
+*.pyd
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
-
-# 模型和數據文件（太大不放入 image）
-checkpoints/*.pth
-checkpoints/*.pt
-finetune_models/*.pth
-finetune_models/*.pt
-*.ckpt
-*.safetensors
-*.bin
-
-# 用戶數據目錄
+# Heavy runtime/training artifacts that are bind-mounted at runtime
+checkpoints/
+outputs/
+logs/
 data/
 finetune_data/
-outputs/
-
-# 日誌
+finetune_models/
+assets/
+prompts/
+downloads/
+__results__/
 *.log
-logs/
-wandb/
-tensorboard/
-
-# 測試
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
-
-# 文檔（除了 README）
-docs/
-QUICKSTART.md
-USAGE.md
-README_SCRIPTS.md
-
-# Docker 相關（不需要進入 image）
-Dockerfile
-docker-compose.yml
-.dockerignore
-
-# 腳本（只在宿主機執行）
-run.sh
-
-# 其他
-.env
-.env.local
-*.bak
-tmp/
-temp/
+*.tmp
+*.tar.gz
+*.pth

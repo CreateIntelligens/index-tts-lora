@@ -18,10 +18,14 @@ services:
     # 環境變數
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-      # - CUDA_VISIBLE_DEVICES=4,5,6,7  # 多卡主機可取消註解並指定 GPU
+      - CUDA_VISIBLE_DEVICES=4,5,6,7  # 多卡主機可取消註解並指定 GPU
+      - UID=${UID:-1000}
+      - GID=${GID:-1000}
+      - USERNAME=${USER:-user}
 
     # 使用當前用戶運行 (避免 root 權限問題)
-    # user: "${UID}:${GID}"  # 取消註解以使用
+    # 暫時註解掉，等修復權限問題後再啟用
+    # user: "${UID:-1000}:${GID:-1000}"
 
     # 端口映射
     ports:
@@ -31,25 +35,25 @@ services:
     volumes:
       - .:/workspace/index-tts-lora
       # for p5
-      - /mnt/data/output1119:/workspace/index-tts-lora/data
+      - /mnt/data/output:/workspace/index-tts-lora/data
       # for A4000
-      - /mnt/nas/ml-material/segment_data/output/:/workspace/index-tts-lora/data
+      # - /mnt/nas/ml-material/segment_data/output/:/workspace/index-tts-lora/data
 
     working_dir: /workspace/index-tts-lora
 
-    # 共享內存大小
-    shm_size: '16gb'
+    # 共享內存大小（DataLoader 多進程需要）
+    shm_size: '128gb'
 
     # 默認啟動 WebUI (entrypoint.sh 會先檢查模型)
     command: python3 webui.py --host 0.0.0.0 --port 7860
 
-    # 自動重啟策略
-    restart: always
+    # 自動重啟策略（包含健康檢查失敗時）
+    restart: unless-stopped
 
     # NVIDIA GPU 健康檢查
     healthcheck:
-      test: ["CMD", "nvidia-smi"]
+      test: ["CMD-SHELL", "/bin/bash /gpu-healthcheck.sh"]
       interval: 30s
-      timeout: 10s
-      retries: 3
+      timeout: 5s
+      retries: 2
       start_period: 40s

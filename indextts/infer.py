@@ -9,6 +9,7 @@ from typing import Dict, List, Tuple, Optional
 import torch
 import torch.nn as nn
 import torchaudio
+import soundfile as sf
 from omegaconf import OmegaConf
 from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
@@ -145,15 +146,16 @@ def _quantize_linear_layers_to_int8(model: nn.Module, target_modules: Optional[L
     return replaced_count
 
 
-def _quantize_linear_layers_to_int4(model: nn.Module, target_modules: Optional[List[str]] = None, verbose: bool = True) -> int:
+def _quantize_linear_layers_to_int4(model: nn.Module, target_modules: Optional[List[str]] = None, verbose: bool = True, compute_dtype: torch.dtype = torch.bfloat16) -> int:
     """
     將模型中的 nn.Linear 層替換為 bitsandbytes 的 Linear4bit (NF4)。
-    
+
     Args:
         model: 要量化的模型
         target_modules: 要量化的模組名稱列表
         verbose: 是否輸出詳細日誌
-    
+        compute_dtype: 量化層的運算精度（預設 BF16）
+
     Returns:
         替換的層數
     """
@@ -197,7 +199,7 @@ def _quantize_linear_layers_to_int4(model: nn.Module, target_modules: Optional[L
             module.in_features,
             module.out_features,
             bias=has_bias,
-            compute_dtype=torch.bfloat16,
+            compute_dtype=compute_dtype,  # 使用配置的運算精度
             quant_type='nf4',  # 使用 NF4 量化
         )
         
@@ -264,7 +266,8 @@ class IndexTTS:
         self.model_dir = model_dir
 
         # 處理混合精度配置
-        # 優先順序：1. precision_config 參數 -> 2. config_inference.yaml -> 3. config.yaml 的 inference 區塊
+        # 優先順序：1. precision_config 參數 -> 2. config_inference.yaml -> 3. config.yaml 的 inference 區塊 -> 4. is_fp16（向後兼容）
+        config_source = None
         if precision_config is None:
             # 先嘗試讀取專門的推理配置檔
             inference_config_path = os.path.join(model_dir, "config_inference.yaml")
@@ -272,10 +275,13 @@ class IndexTTS:
                 inference_cfg = OmegaConf.load(inference_config_path)
                 if hasattr(inference_cfg, 'inference'):
                     precision_config = inference_cfg.inference
-                    print(f">> 載入推理配置: {inference_config_path}")
+                    config_source = f"config_inference.yaml"
             # 回退到原始 config.yaml 的 inference 區塊
             elif hasattr(self.cfg, 'inference'):
                 precision_config = self.cfg.inference
+                config_source = "config.yaml [inference]"
+        else:
+            config_source = "程式碼參數 (precision_config)"
 
         # 解析精度配置
         def resolve_dtype(precision_str):
@@ -308,7 +314,7 @@ class IndexTTS:
                 self.load_in_8bit = (weight_dtype == 'int8')
                 self.load_in_4bit = (weight_dtype == 'int4')
 
-                print(f">> 使用量化推理 (進階模式):")
+                print(f">> 使用量化推理 (進階模式) - 配置來源: {config_source}")
                 print(f"   - 權重存儲: {weight_dtype.upper()} (省 {'75%' if weight_dtype == 'int8' else '87.5%'} 顯存)")
                 print(f"   - 運算精度: {self.gpt_compute_dtype}")
                 print(f"   - Vocoder: {vocoder_precision}")
@@ -320,7 +326,8 @@ class IndexTTS:
                 self.use_quantization = True
                 self.load_in_8bit = True
                 self.load_in_4bit = False
-                print(f">> 使用 INT8 量化推理: 權重=INT8, 運算=BF16, Vocoder={vocoder_precision}")
+                print(f">> 使用 INT8 量化推理 - 配置來源: {config_source}")
+                print(f"   權重=INT8, 運算=BF16, Vocoder={vocoder_precision}")
 
             elif gpt_precision == 'int4':
                 # 簡單模式：int4 (權重 INT4 + 運算 BF16)
@@ -329,7 +336,8 @@ class IndexTTS:
                 self.use_quantization = True
                 self.load_in_8bit = False
                 self.load_in_4bit = True
-                print(f">> 使用 INT4 量化推理: 權重=INT4, 運算=BF16, Vocoder={vocoder_precision}")
+                print(f">> 使用 INT4 量化推理 - 配置來源: {config_source}")
+                print(f"   權重=INT4, 運算=BF16, Vocoder={vocoder_precision}")
 
             else:
                 # 標準模式：直接使用指定精度
@@ -337,22 +345,37 @@ class IndexTTS:
                 self.use_quantization = False
                 self.load_in_8bit = False
                 self.load_in_4bit = False
-                print(f">> 使用混合精度推理: GPT={self.gpt_dtype}, Vocoder={vocoder_precision}")
+                print(f">> 使用混合精度推理 - 配置來源: {config_source}")
+                print(f"   GPT={self.gpt_dtype}, Vocoder={vocoder_precision}")
 
             self.vocoder_dtype = resolve_dtype(vocoder_precision)
             self.dvae_dtype = self.gpt_dtype if not self.use_quantization and isinstance(self.gpt_dtype, torch.dtype) else torch.bfloat16
         else:
-            # 向後兼容：使用 is_fp16
+            # 向後兼容：使用 is_fp16（自動選擇 BF16 或 FP16）
             if self.is_fp16:
-                self.gpt_dtype = torch.float16
-                self.vocoder_dtype = torch.float16
-                self.dvae_dtype = torch.float16
-                print(">> 使用 FP16 推理")
+                # 優先使用 BF16（數值穩定性更好），不支援才用 FP16
+                if torch.cuda.is_bf16_supported():
+                    self.gpt_dtype = torch.bfloat16
+                    self.vocoder_dtype = torch.bfloat16
+                    self.dvae_dtype = torch.bfloat16
+                    print(">> 使用 BF16 推理 - 配置來源: is_fp16 參數（向後兼容模式，自動選擇 BF16）")
+                else:
+                    self.gpt_dtype = torch.float16
+                    self.vocoder_dtype = torch.float16
+                    self.dvae_dtype = torch.float16
+                    print(">> 使用 FP16 推理 - 配置來源: is_fp16 參數（向後兼容模式）")
+                print("   建議: 使用 config_inference.yaml 或 config.yaml [inference] 進行精度配置")
             else:
                 self.gpt_dtype = torch.float32
                 self.vocoder_dtype = torch.float32
                 self.dvae_dtype = torch.float32
-                print(">> 使用 FP32 推理")
+                print(">> 使用 FP32 推理 - 配置來源: 預設值（向後兼容模式）")
+                print("   建議: 使用 config_inference.yaml 或 config.yaml [inference] 進行精度配置")
+
+            # 向後兼容模式不使用量化
+            self.use_quantization = False
+            self.load_in_8bit = False
+            self.load_in_4bit = False
 
         # 向後兼容
         self.dtype = self.gpt_dtype if self.gpt_dtype != torch.float32 else None
@@ -376,8 +399,6 @@ class IndexTTS:
         # 使用量化載入
         if self.use_quantization:
             try:
-                import bitsandbytes as bnb
-
                 # 載入模型（先以 FP32 載入）
                 self.gpt = UnifiedVoice(**self.cfg.gpt)
                 load_checkpoint(self.gpt, self.gpt_path)
@@ -396,7 +417,7 @@ class IndexTTS:
                     replaced = _quantize_linear_layers_to_int8(self.gpt, target_modules, verbose=True)
                     quant_type = "INT8"
                 elif self.load_in_4bit:
-                    replaced = _quantize_linear_layers_to_int4(self.gpt, target_modules, verbose=True)
+                    replaced = _quantize_linear_layers_to_int4(self.gpt, target_modules, verbose=True, compute_dtype=self.gpt_compute_dtype)
                     quant_type = "INT4 (NF4)"
                 else:
                     replaced = 0
@@ -484,11 +505,19 @@ class IndexTTS:
         self.bigvgan.load_state_dict(vocoder_dict["generator"])
         self.bigvgan = self.bigvgan.to(self.device)
 
-        # 使用細粒度精度
+        # 使用細粒度精度（保持 BatchNorm 為 FP32）
         if self.vocoder_dtype == torch.float16:
             self.bigvgan.half()
+            # BatchNorm 層回退到 FP32
+            for module in self.bigvgan.modules():
+                if isinstance(module, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d)):
+                    module.float()
         elif self.vocoder_dtype == torch.bfloat16:
             self.bigvgan.to(torch.bfloat16)
+            # BatchNorm 層回退到 FP32
+            for module in self.bigvgan.modules():
+                if isinstance(module, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d)):
+                    module.float()
 
         # remove weight norm on eval mode
         self.bigvgan.remove_weight_norm()
@@ -521,6 +550,67 @@ class IndexTTS:
                 self.speaker_list = []
         else:
             print(">> Single-speaker mode (no speaker_info_path provided)")
+
+        # 驗證模型精度
+        self._verify_model_precision()
+
+    def _verify_model_precision(self):
+        """
+        驗證模型實際載入的精度是否符合預期。
+        這有助於及早發現精度配置錯誤。
+        """
+        print("=" * 60)
+        print(">> 🔍 驗證模型精度...")
+
+        # 驗證 GPT 模型精度
+        try:
+            # 獲取 GPT 模型的第一個參數的精度
+            gpt_actual_dtype = next(self.gpt.parameters()).dtype
+
+            if self.use_quantization:
+                # 量化模式：檢查運算精度（權重可能是 INT8/INT4）
+                expected_dtype = self.gpt_compute_dtype
+                print(f">> GPT 模型 (量化模式):")
+                print(f"   - 預期運算精度: {expected_dtype}")
+                print(f"   - 實際參數精度: {gpt_actual_dtype}")
+                # 注意：量化後某些層可能是量化類型，這裡只是檢查非量化參數
+                if hasattr(gpt_actual_dtype, '__name__'):
+                    dtype_name = gpt_actual_dtype.__name__ if hasattr(gpt_actual_dtype, '__name__') else str(gpt_actual_dtype)
+                    if 'int' in dtype_name.lower() or 'Int' in str(type(gpt_actual_dtype)):
+                        print(f"   ✅ 量化參數偵測到: {gpt_actual_dtype}")
+                    else:
+                        print(f"   ✅ 非量化參數精度: {gpt_actual_dtype}")
+            else:
+                # 標準精度模式
+                expected_dtype = self.gpt_dtype
+                print(f">> GPT 模型:")
+                print(f"   - 預期精度: {expected_dtype}")
+                print(f"   - 實際精度: {gpt_actual_dtype}")
+
+                if gpt_actual_dtype != expected_dtype:
+                    print(f"   ⚠️  警告：精度不符！請檢查模型載入流程")
+                else:
+                    print(f"   ✅ 精度驗證通過")
+        except Exception as e:
+            print(f"   ⚠️  GPT 精度驗證失敗: {e}")
+
+        # 驗證 BigVGAN 模型精度
+        try:
+            vocoder_actual_dtype = next(self.bigvgan.parameters()).dtype
+            expected_vocoder_dtype = self.vocoder_dtype
+
+            print(f">> BigVGAN 聲碼器:")
+            print(f"   - 預期精度: {expected_vocoder_dtype}")
+            print(f"   - 實際精度: {vocoder_actual_dtype}")
+
+            if vocoder_actual_dtype != expected_vocoder_dtype:
+                print(f"   ⚠️  警告：精度不符！請檢查模型載入流程")
+            else:
+                print(f"   ✅ 精度驗證通過")
+        except Exception as e:
+            print(f"   ⚠️  Vocoder 精度驗證失敗: {e}")
+
+        print("=" * 60)
 
     def remove_long_silence(self, codes: torch.Tensor, silent_token=52, max_consecutive=30):
         """
@@ -698,7 +788,8 @@ class IndexTTS:
 
         # 如果參考音訊改變了，才需要重新生成 cond_mel, 提升速度
         if self.cache_cond_mel is None or self.cache_audio_prompt != audio_prompt:
-            audio, sr = torchaudio.load(audio_prompt)
+            audio, sr = sf.read(audio_prompt)
+            audio = torch.from_numpy(audio.T if audio.ndim > 1 else audio.reshape(1, -1)).float()
             audio = torch.mean(audio, dim=0, keepdim=True)
             if audio.shape[0] > 1:
                 audio = audio[0].unsqueeze(0)
@@ -917,7 +1008,8 @@ class IndexTTS:
 
         # 如果參考音訊改變了，才需要重新生成 cond_mel, 提升速度
         if self.cache_cond_mel is None or self.cache_audio_prompt != audio_prompt:
-            audio, sr = torchaudio.load(audio_prompt)
+            audio, sr = sf.read(audio_prompt)
+            audio = torch.from_numpy(audio.T if audio.ndim > 1 else audio.reshape(1, -1)).float()
             audio = torch.mean(audio, dim=0, keepdim=True)
             if audio.shape[0] > 1:
                 audio = audio[0].unsqueeze(0)

@@ -28,6 +28,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchaudio
+import soundfile as sf
 from loguru import logger
 from omegaconf import OmegaConf
 from tqdm import tqdm
@@ -95,7 +96,8 @@ class AudioDataset(torch.utils.data.Dataset):
         sample = self.samples[idx]
 
         try:
-            audio, sr = torchaudio.load(sample['wav_path'])
+            audio, sr = sf.read(sample["wav_path"])
+            audio = torch.from_numpy(audio.T if audio.ndim > 1 else audio.reshape(1, -1)).float()
             return {
                 'wav_path': sample['wav_path'],
                 'text': sample['text'],
@@ -745,45 +747,186 @@ def split_dataset(
     return train_file, valid_file
 
 
+def check_and_generate_speaker_info(output_dir: str) -> None:
+    """檢查所有 part 是否處理完成，如果是則生成 speaker_info.json"""
+    import glob
+    from collections import defaultdict
+
+    processed_data_dir = os.path.dirname(output_dir)
+
+    # 檢查有多少個 audio_list part 檔案
+    audio_list_dir = os.path.join(processed_data_dir, "..", "audio_list")
+    audio_list_files = glob.glob(os.path.join(audio_list_dir, "audio_list_part_*.txt"))
+    total_parts = len(audio_list_files)
+
+    # 檢查有多少個已處理的 part 目錄
+    processed_dirs = glob.glob(os.path.join(processed_data_dir, 'audio_list_part_*'))
+    completed_parts = len([d for d in processed_dirs if os.path.exists(os.path.join(d, 'metadata.jsonl'))])
+
+    logger.info(f"進度: {completed_parts}/{total_parts} 個 part 已處理完成")
+
+    if completed_parts < total_parts:
+        logger.info("等待其他 part 處理完成...")
+        return
+
+    # 所有 part 都處理完了，生成 speaker_info.json
+    logger.info("🎉 所有 part 已處理完成，開始生成 speaker_info.json...")
+
+    speaker_info_file = os.path.join(processed_data_dir, 'speaker_info.json')
+    lock_file = speaker_info_file + '.lock'
+
+    # 使用檔案鎖確保只有一個進程生成
+    import fcntl
+    try:
+        with open(lock_file, 'w') as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            # 檢查是否已經生成過了
+            if os.path.exists(speaker_info_file):
+                logger.info("speaker_info.json 已存在，跳過生成")
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                return
+
+            # 收集所有 speaker 資訊
+            speaker_data = defaultdict(list)
+            total_samples = 0
+
+            for proc_dir in sorted(processed_dirs):
+                metadata_file = os.path.join(proc_dir, 'metadata.jsonl')
+                if not os.path.exists(metadata_file):
+                    continue
+
+                with open(metadata_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        data = json.loads(line)
+                        audio_path = data["audio"]
+                        path_parts = Path(audio_path).parts
+
+                        # 提取 speaker ID
+                        data_idx = path_parts.index("data") if "data" in path_parts else -1
+                        if data_idx >= 0 and len(path_parts) > data_idx + 2:
+                            drama_name = path_parts[data_idx + 1]
+                            character_id = path_parts[data_idx + 2]
+                            speaker_id = f"{drama_name}_{character_id}"
+                        else:
+                            speaker_id = os.path.basename(proc_dir)
+
+                        speaker_data[speaker_id].append(data)
+                        total_samples += 1
+
+            # 生成 speaker_info
+            speaker_info_list = []
+            for speaker_id in sorted(speaker_data.keys()):
+                lines = speaker_data[speaker_id]
+                total_duration = sum(line["duration"] for line in lines)
+                ref_dir = os.path.dirname(lines[0]["codes"])
+
+                speaker_info = {
+                    "speaker": speaker_id,
+                    "avg_duration": total_duration / len(lines),
+                    "sample_num": len(lines),
+                    "total_duration": total_duration,
+                    "train_jsonl": os.path.abspath(os.path.join(ref_dir, "metadata_train.jsonl")),
+                    "valid_jsonl": os.path.abspath(os.path.join(ref_dir, "metadata_valid.jsonl")),
+                    "medoid_condition": os.path.abspath(os.path.join(ref_dir, "medoid_condition.npy")),
+                }
+                speaker_info_list.append(speaker_info)
+
+            # 儲存
+            with open(speaker_info_file, 'w', encoding='utf-8') as f:
+                json.dump(speaker_info_list, f, ensure_ascii=False, indent=4)
+            fix_permissions(speaker_info_file)
+
+            logger.info(f"✅ speaker_info.json 生成完成")
+            logger.info(f"   - 總 speaker 數: {len(speaker_info_list)}")
+            logger.info(f"   - 總樣本數: {sum(s['sample_num'] for s in speaker_info_list)}")
+
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    except BlockingIOError:
+        # 其他進程正在生成，跳過
+        logger.info("其他進程正在生成 speaker_info.json，跳過")
+        return
+
+
 def save_speaker_info(
     audio_list_path: str,
     output_dir: str,
     lines: List[str]
 ) -> None:
     """儲存說話人資訊"""
+    # 從 WAV 路徑提取 speaker ID (人物目錄)
+    first_line = json.loads(lines[0])
+    wav_path = first_line["audio"]  # metadata 中的欄位名稱是 "audio"
+    path_parts = Path(wav_path).parts
+    data_idx = path_parts.index("data") if "data" in path_parts else -1
+    if data_idx >= 0 and len(path_parts) > data_idx + 2:
+        drama_name = path_parts[data_idx + 1]
+        character_id = path_parts[data_idx + 2]
+        speaker_id = f"{drama_name}_{character_id}"
+    else:
+        speaker_id = Path(audio_list_path).stem
+
     total_duration = sum(json.loads(line)["duration"] for line in lines)
     speaker_info = {
-        "speaker": Path(audio_list_path).stem,
+        "speaker": speaker_id,
         "avg_duration": total_duration / len(lines),
         "sample_num": len(lines),
-        "total_duration_in_seconds": total_duration,
-        "total_duration_in_minutes": total_duration / 60,
-        "total_duration_in_hours": total_duration / 3600,
+        "total_duration": total_duration,
         "train_jsonl": os.path.abspath(os.path.join(output_dir, "metadata_train.jsonl")),
         "valid_jsonl": os.path.abspath(os.path.join(output_dir, "metadata_valid.jsonl")),
         "medoid_condition": os.path.abspath(os.path.join(output_dir, "medoid_condition.npy")),
     }
     
     speaker_info_file = os.path.join(output_dir, "..", 'speaker_info.json')
+    lock_file = speaker_info_file + '.lock'
 
-    # 讀取現有資訊或建立新列表
-    if os.path.exists(speaker_info_file):
-        with open(speaker_info_file, 'r', encoding='utf-8') as f:
-            speaker_info_list = json.load(f)
-    else:
-        speaker_info_list = []
+    # 使用檔案鎖避免多 GPU 同時寫入
+    import fcntl
+    import time
 
-    # 移除舊的同名 speaker（如果存在）
-    current_speaker_id = speaker_info["speaker"]
-    speaker_info_list = [s for s in speaker_info_list if s["speaker"] != current_speaker_id]
+    max_retries = 10
+    for attempt in range(max_retries):
+        try:
+            # 取得鎖
+            with open(lock_file, 'w') as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
 
-    # 加入新的 speaker 資訊
-    speaker_info_list.append(speaker_info)
+                # 讀取現有資訊或建立新列表
+                if os.path.exists(speaker_info_file):
+                    try:
+                        with open(speaker_info_file, 'r', encoding='utf-8') as f:
+                            speaker_info_list = json.load(f)
+                        logger.debug(f"讀取到 {len(speaker_info_list)} 個現有 speaker")
+                    except (json.JSONDecodeError, IOError) as e:
+                        # 如果檔案損壞，重新建立
+                        logger.warning(f"speaker_info.json 損壞，重新建立: {e}")
+                        speaker_info_list = []
+                else:
+                    logger.debug("speaker_info.json 不存在，建立新檔案")
+                    speaker_info_list = []
 
-    # 儲存更新後的資訊
-    with open(speaker_info_file, 'w', encoding='utf-8') as f:
-        json.dump(speaker_info_list, f, ensure_ascii=False, indent=4)
-    fix_permissions(speaker_info_file)
+                # 移除舊的同名 speaker（如果存在）
+                current_speaker_id = speaker_info["speaker"]
+                speaker_info_list = [s for s in speaker_info_list if s["speaker"] != current_speaker_id]
+
+                # 加入新的 speaker 資訊
+                speaker_info_list.append(speaker_info)
+
+                # 儲存更新後的資訊
+                with open(speaker_info_file, 'w', encoding='utf-8') as f:
+                    json.dump(speaker_info_list, f, ensure_ascii=False, indent=4)
+                fix_permissions(speaker_info_file)
+
+                # 釋放鎖
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                break
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"寫入 speaker_info.json 失敗 (嘗試 {attempt+1}/{max_retries}): {e}")
+                time.sleep(0.5)
+            else:
+                raise
 
 
 def setup_models(
@@ -1142,10 +1285,8 @@ def main():
     # 分割資料集
     split_dataset(metadata_file, output_dir)
 
-    # 儲存說話人資訊
-    with open(metadata_file, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
-    save_speaker_info(args.audio_list, output_dir, lines)
+    # 檢查是否所有 part 都處理完了，如果是則自動生成 speaker_info.json
+    check_and_generate_speaker_info(output_dir)
 
     # 清理 GPU 記憶體
     logger.info("清理 GPU 記憶體...")

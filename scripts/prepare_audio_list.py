@@ -59,55 +59,51 @@ def has_audio_files(directory: Path) -> bool:
 def scan_speaker_dirs(base_dir: Path) -> List[Path]:
     """
     自動掃描數據目錄下的所有說話人子目錄
-    支援多層結構:
+    
+    針對結構: data/drama1/人物ID/集數/*.wav
+    策略: 以「人物ID」目錄（第二層）作為 speaker，包含該人物的所有集數
+    
+    支援結構:
       1. data/speaker_001/*.wav  (直接包含音頻)
-      2. data/drama1/speaker_001/*.wav  (兩層)
-      3. data/drama1/speaker_001/session_01/*.wav  (三層或更多)
-
-    策略:找到最接近 base_dir 且包含音頻的目錄層級
-
+      2. data/drama1/speaker_001/*.wav  (兩層，直接有音頻)
+      3. data/drama1/人物ID/集數/*.wav  (三層，音頻在最深層) ← 您的結構
+    
     Args:
         base_dir: 基礎數據目錄 (如 data/)
-
+    
     Returns:
         說話人目錄列表
     """
     speaker_dirs = []
-
-    # 先掃描第一層子目錄
+    
+    # 先掃描第一層子目錄 (如 drama1, drama2)
     for subdir in sorted(base_dir.iterdir()):
         if not subdir.is_dir():
             continue
-
-        # 檢查第一層是否直接有音頻(不算子目錄裡的)
+        
+        # 檢查第一層是否直接有音頻
         direct_audio = len(list(subdir.glob("*.wav"))) > 0
-
+        
         if direct_audio:
             # 情況 1: data/speaker_001/*.wav 直接包含音頻
             speaker_dirs.append(subdir)
         else:
-            # 往下找一層(第二層)
-            has_second_level = False
-            for sub_subdir in sorted(subdir.iterdir()):
-                if not sub_subdir.is_dir():
+            # 掃描第二層 (人物ID)
+            for character_dir in sorted(subdir.iterdir()):
+                if not character_dir.is_dir():
                     continue
-
+                
                 # 檢查第二層是否直接有音頻
-                second_level_audio = len(list(sub_subdir.glob("*.wav"))) > 0
-
-                if second_level_audio:
-                    # 情況 2: data/drama1/speaker_001/*.wav
-                    speaker_dirs.append(sub_subdir)
-                    has_second_level = True
-                elif has_audio_files(sub_subdir):
-                    # 情況 3: data/drama1/speaker_001/session/*.wav (音頻在更深層)
-                    speaker_dirs.append(sub_subdir)
-                    has_second_level = True
-
-            # 如果第二層沒找到,可能整個第一層目錄就是一個 speaker
-            if not has_second_level and has_audio_files(subdir):
-                speaker_dirs.append(subdir)
-
+                has_direct_audio = len(list(character_dir.glob("*.wav"))) > 0
+                
+                if has_direct_audio:
+                    # 情況 2: data/drama1/speaker_001/*.wav 直接有音頻
+                    speaker_dirs.append(character_dir)
+                elif has_audio_files(character_dir):
+                    # 情況 3: data/drama1/人物ID/集數/*.wav (音頻在更深層)
+                    # 把人物ID目錄作為 speaker，包含其下所有集數的音頻
+                    speaker_dirs.append(character_dir)
+    
     return speaker_dirs
 
 
