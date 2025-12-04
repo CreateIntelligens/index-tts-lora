@@ -191,6 +191,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             )
 
             reload_button = gr.Button("🔄 載入模型", variant="primary")
+            refresh_button = gr.Button("🔍 重新掃描", variant="secondary")
 
         model_status = gr.Textbox(label="狀態", interactive=False, value=f"✅ 當前模型: {os.path.basename(tts.gpt_path)}")
 
@@ -202,10 +203,24 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             result = reload_gpt_model(model_path, progress)
             return result
 
+        # 重新掃描模型列表
+        def on_refresh_models():
+            global available_models
+            available_models = get_available_models()
+            new_choices = list(available_models.keys())
+            return gr.update(choices=new_choices, value=new_choices[0] if new_choices else None), \
+                   f"✅ 掃描完成，找到 {len(new_choices)} 個模型"
+
         reload_button.click(
             on_reload_model,
             inputs=[model_dropdown],
             outputs=[model_status]
+        )
+
+        refresh_button.click(
+            on_refresh_models,
+            inputs=[],
+            outputs=[model_dropdown, model_status]
         )
 
     with gr.Tab("音訊生成"):

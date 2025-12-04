@@ -267,9 +267,10 @@ def build_hf_gpt_transformer(layers, model_dim, heads, max_mel_seq_len, max_text
                             n_layer=layers,
                             n_head=heads,
                             activation_function=activation_function or "gelu_new",
-                            gradient_checkpointing=checkpointing,
                             use_cache=not checkpointing)
     gpt = GPT2Model(gpt_config)
+    if checkpointing:
+        gpt.gradient_checkpointing_enable()
     # Override the built in positional embeddings
     del gpt.wpe
     gpt.wpe = functools.partial(null_position_embeddings, dim=model_dim)
@@ -402,7 +403,6 @@ class UnifiedVoice(nn.Module):
             n_embd=self.model_dim,
             n_layer=self.layers,
             n_head=self.heads,
-            gradient_checkpointing=False,
             use_cache=True,
         )
         self.inference_model = GPT2InferenceModel(

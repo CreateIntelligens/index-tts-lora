@@ -980,8 +980,14 @@ def process_audio_files(
         num_workers: DataLoader worker 數量（建議 4-8）
     """
     metadata_file = os.path.join(output_dir, METADATA_FILENAME)
+    metadata_tmp_file = metadata_file + ".tmp"
     condition_files = []
     metadata_path = Path(metadata_file)
+    metadata_tmp_path = Path(metadata_tmp_file)
+
+    # 如果存在舊的 tmp 文件，先刪除
+    if metadata_tmp_path.exists():
+        metadata_tmp_path.unlink()
 
     # 創建 Dataset 和 DataLoader
     dataset = AudioDataset(args.audio_list)
@@ -995,123 +1001,132 @@ def process_audio_files(
         persistent_workers=True if num_workers > 0 else False
     )
 
-    # 批次處理
-    with tqdm(total=len(dataset), desc="處理音訊檔案") as pbar:
-        for batch in dataloader:
-            # 跳過空批次
-            if len(batch['valid_indices']) == 0:
-                pbar.update(batch_size)
-                continue
-
-            # 批次處理音頻
-            processed_batch = []
-            for audio, sr, wav_path, text in zip(
-                batch['audios'],
-                batch['srs'],
-                batch['wav_paths'],
-                batch['texts']
-            ):
-                try:
-                    # 處理音訊資料
-                    processed_audio, mel, codes = audio_processor.process_audio_data(audio, sr)
-
-                    processed_batch.append({
-                        'wav_path': wav_path,
-                        'text': text,
-                        'processed_audio': processed_audio,
-                        'mel': mel,
-                        'codes': codes,
-                        'success': True
-                    })
-                except Exception as e:
-                    logger.error(f"處理音訊失敗: {wav_path}, {e}")
-                    processed_batch.append({
-                        'wav_path': wav_path,
-                        'success': False
-                    })
-
-            # 批次提取 condition（如果需要）
-            if condition_extractor is not None:
-                # 收集所有成功的 mel
-                mels_batch = [item['mel'] for item in processed_batch if item['success']]
-
-                if len(mels_batch) > 0:
-                    try:
-                        # 批次推理 condition
-                        conditions = condition_extractor.extract_condition_latent_batch(mels_batch)
-
-                        # 分配回各個樣本
-                        cond_idx = 0
-                        for item in processed_batch:
-                            if item['success']:
-                                item['condition'] = conditions[cond_idx]
-                                cond_idx += 1
-                    except Exception as e:
-                        logger.error(f"批次提取 condition 失敗: {e}")
-                        # 降級到逐個處理
-                        for item in processed_batch:
-                            if item['success']:
-                                try:
-                                    item['condition'] = condition_extractor.extract_condition_latent(item['mel'])
-                                except Exception as e:
-                                    logger.error(f"提取 condition 失敗: {item['wav_path']}, {e}")
-                                    item['success'] = False
-
-            # 批次保存結果
-            for item in processed_batch:
-                if not item['success']:
+    try:
+        # 批次處理
+        with tqdm(total=len(dataset), desc="處理音訊檔案") as pbar:
+            for batch in dataloader:
+                # 跳過空批次
+                if len(batch['valid_indices']) == 0:
+                    pbar.update(batch_size)
                     continue
 
-                try:
-                    # 計算音訊時長
-                    duration = item['processed_audio'].shape[-1] / config.dataset.mel.sample_rate
+                # 批次處理音頻
+                processed_batch = []
+                for audio, sr, wav_path, text in zip(
+                    batch['audios'],
+                    batch['srs'],
+                    batch['wav_paths'],
+                    batch['texts']
+                ):
+                    try:
+                        # 處理音訊資料
+                        processed_audio, mel, codes = audio_processor.process_audio_data(audio, sr)
 
-                    # 保存特徵文件
-                    base_name = os.path.basename(item['wav_path'])
-                    out_codebook = os.path.join(output_dir, f"{base_name}_codes.npy")
-                    out_mel = os.path.join(output_dir, f"{base_name}_mel.npy")
+                        processed_batch.append({
+                            'wav_path': wav_path,
+                            'text': text,
+                            'processed_audio': processed_audio,
+                            'mel': mel,
+                            'codes': codes,
+                            'success': True
+                        })
+                    except Exception as e:
+                        logger.error(f"處理音訊失敗: {wav_path}, {e}")
+                        processed_batch.append({
+                            'wav_path': wav_path,
+                            'success': False
+                        })
 
-                    np.save(out_codebook, item['codes'].detach().cpu().numpy())
-                    np.save(out_mel, item['mel'].detach().cpu().numpy())
-                    fix_permissions(out_codebook)
-                    fix_permissions(out_mel)
+                # 批次提取 condition（如果需要）
+                if condition_extractor is not None:
+                    # 收集所有成功的 mel
+                    mels_batch = [item['mel'] for item in processed_batch if item['success']]
 
-                    # 保存 condition
-                    condition_path = None
-                    if 'condition' in item:
-                        condition_path = os.path.join(output_dir, f"{base_name}_condition.npy")
-                        np.save(condition_path, item['condition'])
-                        fix_permissions(condition_path)
-                        condition_files.append(condition_path)
+                    if len(mels_batch) > 0:
+                        try:
+                            # 批次推理 condition
+                            conditions = condition_extractor.extract_condition_latent_batch(mels_batch)
 
-                    # 寫入元資料
-                    data_entry = {
-                        "audio": item['wav_path'],
-                        "text": item['text'],
-                        "codes": os.path.abspath(out_codebook),
-                        "mels": os.path.abspath(out_mel),
-                        "duration": round(duration, 4)
-                    }
+                            # 分配回各個樣本
+                            cond_idx = 0
+                            for item in processed_batch:
+                                if item['success']:
+                                    item['condition'] = conditions[cond_idx]
+                                    cond_idx += 1
+                        except Exception as e:
+                            logger.error(f"批次提取 condition 失敗: {e}")
+                            # 降級到逐個處理
+                            for item in processed_batch:
+                                if item['success']:
+                                    try:
+                                        item['condition'] = condition_extractor.extract_condition_latent(item['mel'])
+                                    except Exception as e:
+                                        logger.error(f"提取 condition 失敗: {item['wav_path']}, {e}")
+                                        item['success'] = False
 
-                    if condition_path:
-                        data_entry["condition"] = os.path.abspath(condition_path)
+                # 批次保存結果
+                for item in processed_batch:
+                    if not item['success']:
+                        continue
 
-                    with open(metadata_file, "a", encoding="utf-8") as out_f:
-                        out_f.write(json.dumps(data_entry, ensure_ascii=False) + "\n")
+                    try:
+                        # 計算音訊時長
+                        duration = item['processed_audio'].shape[-1] / config.dataset.mel.sample_rate
 
-                    if metadata_path.exists():
-                        fix_permissions(metadata_path)
+                        # 保存特徵文件
+                        base_name = os.path.basename(item['wav_path'])
+                        out_codebook = os.path.join(output_dir, f"{base_name}_codes.npy")
+                        out_mel = os.path.join(output_dir, f"{base_name}_mel.npy")
 
-                except Exception as e:
-                    logger.error(f"保存失敗: {item['wav_path']}, {e}")
+                        np.save(out_codebook, item['codes'].detach().cpu().numpy())
+                        np.save(out_mel, item['mel'].detach().cpu().numpy())
+                        fix_permissions(out_codebook)
+                        fix_permissions(out_mel)
 
-            # 更新進度
-            pbar.update(len(batch['audios']))
+                        # 保存 condition
+                        condition_path = None
+                        if 'condition' in item:
+                            condition_path = os.path.join(output_dir, f"{base_name}_condition.npy")
+                            np.save(condition_path, item['condition'])
+                            fix_permissions(condition_path)
+                            condition_files.append(condition_path)
 
-    # 清理 DataLoader 和 worker 進程
-    del dataloader
-    del dataset
-    gc.collect()
+                        # 寫入元資料到 tmp 文件
+                        data_entry = {
+                            "audio": item['wav_path'],
+                            "text": item['text'],
+                            "codes": os.path.abspath(out_codebook),
+                            "mels": os.path.abspath(out_mel),
+                            "duration": round(duration, 4)
+                        }
+
+                        if condition_path:
+                            data_entry["condition"] = os.path.abspath(condition_path)
+
+                        with open(metadata_tmp_file, "a", encoding="utf-8") as out_f:
+                            out_f.write(json.dumps(data_entry, ensure_ascii=False) + "\n")
+
+                    except Exception as e:
+                        logger.error(f"保存失敗: {item['wav_path']}, {e}")
+
+                # 更新進度
+                pbar.update(len(batch['audios']))
+        
+        # 成功完成後，將 tmp 文件重命名為正式文件
+        if metadata_tmp_path.exists():
+            metadata_tmp_path.rename(metadata_path)
+            fix_permissions(metadata_path)
+            logger.info(f"元資料寫入完成: {metadata_file}")
+
+    except Exception as e:
+        logger.error(f"處理過程中發生錯誤: {e}")
+        # 發生錯誤時保留 tmp 文件以便除錯，但不生成正式文件
+        raise
+    finally:
+        # 清理 DataLoader 和 worker 進程
+        del dataloader
+        del dataset
+        gc.collect()
 
     return metadata_file, condition_files
 

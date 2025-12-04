@@ -356,14 +356,14 @@ class IndexTTS:
                 # 優先使用 BF16（數值穩定性更好），不支援才用 FP16
                 if torch.cuda.is_bf16_supported():
                     self.gpt_dtype = torch.bfloat16
-                    self.vocoder_dtype = torch.bfloat16
+                    self.vocoder_dtype = torch.float32 # BigVGAN 在 BF16 下可能不穩定，預設回退到 FP32
                     self.dvae_dtype = torch.bfloat16
-                    print(">> 使用 BF16 推理 - 配置來源: is_fp16 參數（向後兼容模式，自動選擇 BF16）")
+                    print(">> 使用 BF16 推理 (GPT) / FP32 (Vocoder) - 配置來源: is_fp16 參數（向後兼容模式）")
                 else:
                     self.gpt_dtype = torch.float16
-                    self.vocoder_dtype = torch.float16
+                    self.vocoder_dtype = torch.float32 # BigVGAN 在 FP16 下可能不穩定，預設回退到 FP32
                     self.dvae_dtype = torch.float16
-                    print(">> 使用 FP16 推理 - 配置來源: is_fp16 參數（向後兼容模式）")
+                    print(">> 使用 FP16 推理 (GPT) / FP32 (Vocoder) - 配置來源: is_fp16 參數（向後兼容模式）")
                 print("   建議: 使用 config_inference.yaml 或 config.yaml [inference] 進行精度配置")
             else:
                 self.gpt_dtype = torch.float32
@@ -948,9 +948,20 @@ class IndexTTS:
             tqdm_progress.update(len(items))
             latent = torch.cat(items, dim=1)
             with torch.no_grad():
-                with torch.amp.autocast(latent.device.type, enabled=self.dtype is not None, dtype=self.dtype):
+                # Determine autocast settings for vocoder
+                vocoder_autocast_enabled = self.vocoder_dtype != torch.float32
+                vocoder_autocast_dtype = self.vocoder_dtype if vocoder_autocast_enabled else None
+
+                # Explicitly cast inputs if vocoder is FP32
+                if not vocoder_autocast_enabled:
+                    latent = latent.float()
+                    cond_input = auto_conditioning.transpose(1, 2).float()
+                else:
+                    cond_input = auto_conditioning.transpose(1, 2)
+
+                with torch.amp.autocast(latent.device.type, enabled=vocoder_autocast_enabled, dtype=vocoder_autocast_dtype):
                     m_start_time = time.perf_counter()
-                    wav, _ = self.bigvgan(latent, auto_conditioning.transpose(1, 2))
+                    wav, _ = self.bigvgan(latent, cond_input)
                     bigvgan_time += time.perf_counter() - m_start_time
                     wav = wav.squeeze(1)
                     pass
@@ -982,7 +993,10 @@ class IndexTTS:
         if output_path:
             # 直接儲存音訊到指定路徑中
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            torchaudio.save(output_path, wav.type(torch.int16), sampling_rate)
+            # 直接使用 soundfile 避免 torchaudio.save 的 torchcodec 依賴問題
+            # 先轉成 int16，再轉 numpy（soundfile 會正確處理 int16）
+            wav_int16 = wav.squeeze(0).to(torch.float32).numpy().astype('int16')
+            sf.write(output_path, wav_int16, sampling_rate, subtype='PCM_16')
             print(">> wav file saved to:", output_path)
             return output_path
         else:
@@ -1126,8 +1140,20 @@ class IndexTTS:
                     )
                     gpt_forward_time += time.perf_counter() - m_start_time
 
+                # Determine autocast settings for vocoder
+                vocoder_autocast_enabled = self.vocoder_dtype != torch.float32
+                vocoder_autocast_dtype = self.vocoder_dtype if vocoder_autocast_enabled else None
+
+                # Explicitly cast inputs if vocoder is FP32
+                if not vocoder_autocast_enabled:
+                    latent = latent.float()
+                    cond_input = auto_conditioning.transpose(1, 2).float()
+                else:
+                    cond_input = auto_conditioning.transpose(1, 2)
+
+                with torch.amp.autocast(text_tokens.device.type, enabled=vocoder_autocast_enabled, dtype=vocoder_autocast_dtype):
                     m_start_time = time.perf_counter()
-                    wav, _ = self.bigvgan(latent, auto_conditioning.transpose(1, 2))
+                    wav, _ = self.bigvgan(latent, cond_input)
                     bigvgan_time += time.perf_counter() - m_start_time
                     wav = wav.squeeze(1)
 
@@ -1157,7 +1183,10 @@ class IndexTTS:
                 print(">> remove old wav file:", output_path)
             if os.path.dirname(output_path) != "":
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            torchaudio.save(output_path, wav.type(torch.int16), sampling_rate)
+            # 直接使用 soundfile 避免 torchaudio.save 的 torchcodec 依賴問題
+            # 先轉成 int16，再轉 numpy（soundfile 會正確處理 int16）
+            wav_int16 = wav.squeeze(0).to(torch.float32).numpy().astype('int16')
+            sf.write(output_path, wav_int16, sampling_rate, subtype='PCM_16')
             print(">> wav file saved to:", output_path)
             return output_path
         else:

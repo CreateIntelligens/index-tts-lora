@@ -153,18 +153,18 @@ train:
     # === GPU 使用率優化參數 - 針對 A100 80GB 優化 ===
     batch_size: 128             # 每 GPU 的 batch 大小
     valid_batch_size: 256       # 驗證批次
-    num_workers: 2              # DataLoader worker 數（DDP 每個 rank 各自）
-    valid_num_workers: 2
-    prefetch_factor: 2          # 每個 worker 預先拉 2 個 batch
-    persistent_workers: true    # 保持 worker 避免頻繁啟動開銷
-    lazy_load_metadata: true     # 懶載入 metadata，只存 offset 索引以降低常駐記憶體
+    num_workers: 0              # 設為 0 以防止 DDP 死鎖
+    valid_num_workers: 0        # 設為 0 以防止 DDP 死鎖
+    prefetch_factor: null       # num_workers=0 時必須為 null
+    persistent_workers: false   # num_workers=0 時必須為 false
+    lazy_load_metadata: true     # 真正的 lazy loading（不預先掃描，訓練時才讀檔案）
 
     gradient_accumulation_steps: 2  # 從 8 → 2，有效 batch = 64×2 = 128
     max_grad_norm: 1.0
     text_weight: 0.1
     early_stopping_patience: 1
     max_steps_per_epoch: 150 # 每個 epoch 最大訓練樣本數
-    data_path: "finetune_data/processed_data"
+    data_path: "finetune_data/processed_data/"
 
     # =========================================================================
     # 混合精度訓練 (PyTorch AMP)

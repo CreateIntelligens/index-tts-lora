@@ -532,6 +532,7 @@ class Trainer:
             lora_alpha=lora_cfg.lora_alpha,
             lora_dropout=lora_cfg.lora_dropout,
             bias="none",
+            fan_in_fan_out=True,
         )
         model.requires_grad_(False)
         model.inference_model = get_peft_model(model.inference_model, gpt_lora_config)

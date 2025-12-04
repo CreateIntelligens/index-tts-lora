@@ -25,7 +25,8 @@ import copy
 import gc
 import os
 import random
-from datetime import datetime
+import datetime
+from datetime import datetime as dt
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -72,8 +73,18 @@ def setup_ddp(rank: int, world_size: int):
     if 'MASTER_PORT' not in os.environ:
         os.environ['MASTER_PORT'] = '12355'
 
+    # Fix for NCCL connection issues
+    # 預設禁用 P2P 和 IB 以防止在某些環境（如 Docker 或消費級 GPU）中出現連線逾時或掛死
+    if 'NCCL_P2P_DISABLE' not in os.environ:
+        os.environ['NCCL_P2P_DISABLE'] = '1'
+    if 'NCCL_IB_DISABLE' not in os.environ:
+        os.environ['NCCL_IB_DISABLE'] = '1'
+    if 'NCCL_NET' not in os.environ:
+        os.environ['NCCL_NET'] = 'Socket'
+
     # 初始化進程組
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    # 設定 30 分鐘的超時，防止主進程保存模型時其他進程超時
+    dist.init_process_group("nccl", rank=rank, world_size=world_size, timeout=datetime.timedelta(minutes=30))
     torch.cuda.set_device(rank)
 
 
@@ -101,8 +112,8 @@ class DDPTrainer:
         self.is_main_process = (rank == 0)
 
         # 只有主進程打印訊息
-        if not self.is_main_process:
-            logger.remove()  # 移除其他進程的日誌輸出
+        # if not self.is_main_process:
+        #    logger.remove()  # 移除其他進程的日誌輸出
 
         # 設定隨機種子
         self._set_seed(self.config.train.seed + rank)  # 每個 rank 不同的種子
@@ -139,7 +150,7 @@ class DDPTrainer:
 
     def _setup_logging(self):
         """配置日誌記錄器（只在主進程）"""
-        log_path = os.path.join(self.checkpoint_dir, f"train_ddp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+        log_path = os.path.join(self.checkpoint_dir, f"train_ddp_{dt.now().strftime('%Y%m%d_%H%M%S')}.txt")
         logger.add(log_path, level="INFO", encoding="utf-8")
         logger.info(f"🚀 DDP Training with {self.world_size} GPUs")
         logger.info("Full configuration:\n" + OmegaConf.to_yaml(self.config))
@@ -202,6 +213,7 @@ class DDPTrainer:
             lora_alpha=lora_cfg.lora_alpha,
             lora_dropout=lora_cfg.lora_dropout,
             bias="none",
+            fan_in_fan_out=True,
         )
         model.requires_grad_(False)
         model.inference_model = get_peft_model(model.inference_model, gpt_lora_config)
@@ -255,7 +267,7 @@ class DDPTrainer:
             collate_fn=collate_finetune_fn,
             num_workers=train_num_workers,
             pin_memory=True,
-            drop_last=False,
+            drop_last=True,  # 避免 DDP 末尾 batch 不齊卡住
         )
 
         valid_batch_size = train_cfg.get("valid_batch_size", 4)
@@ -267,7 +279,7 @@ class DDPTrainer:
             collate_fn=collate_finetune_fn,
             num_workers=valid_num_workers,
             pin_memory=True,
-            drop_last=False,
+            drop_last=True,  # 驗證也對齊 batch 長度
         )
 
         steps_per_epoch = len(train_loader)
@@ -310,6 +322,9 @@ class DDPTrainer:
             self.model.train()
 
             for batch_idx, batch in enumerate(train_loader):
+                # if batch_idx % 5 == 0:
+                print(f"[Rank {self.rank}] Processing batch {batch_idx}/{steps_per_epoch}", flush=True)
+
                 # 將資料移到對應的 GPU
                 data_batch = []
                 for item in batch:
@@ -325,8 +340,10 @@ class DDPTrainer:
 
                 if torch.isnan(weighted_loss) or torch.isinf(weighted_loss):
                     if self.is_main_process:
-                        logger.warning(f"NaN/Inf loss at epoch {epoch}, batch {batch_idx}. Skipping.")
-                    continue
+                        logger.warning(f"NaN/Inf loss at epoch {epoch}, batch {batch_idx}. Zeroing loss to maintain DDP sync.")
+                    # DDP CRITICAL FIX: 不能直接 continue，否則會導致該 Rank 跳過 backward，造成全體死鎖。
+                    # 必須傳送一個 0 的 loss 讓 DDP 完成梯度同步。
+                    weighted_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
 
                 # 最佳化步驟
                 self.optimizer.zero_grad()
@@ -346,13 +363,17 @@ class DDPTrainer:
                         f"grad_norm={grad_norm.item():.2f}"
                     )
 
+            print(f"[Rank {self.rank}] Finished epoch {epoch+1} loop. Entering validation/barrier check.", flush=True)
+
             # 驗證（只在主進程）
             if self.is_main_process:
                 val_text_loss, val_mel_loss, _, _, _ = self._validate_epoch(valid_loader, epoch)
                 self._save_checkpoint(epoch, val_text_loss, val_mel_loss)
 
             # 同步所有進程
-            dist.barrier()
+            # print(f"[Rank {self.rank}] Waiting at barrier...", flush=True)
+            # dist.barrier(device_ids=[self.rank])
+            # print(f"[Rank {self.rank}] Passed barrier!", flush=True)
 
     def _train_step(self, batch: Tuple) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """單個訓練步驟"""

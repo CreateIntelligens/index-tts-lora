@@ -66,6 +66,10 @@ train_model() {
     if [ "$mode" = "ddp" ]; then
         print_info "使用 DDP 訓練，GPU 數量: $num_gpus"
 
+        export NCCL_ASYNC_ERROR_HANDLING=1
+        export NCCL_BLOCKING_WAIT=1
+        export NCCL_DEBUG=INFO
+
         if [ "$USE_DOCKER" -eq 1 ]; then
             docker compose exec index-tts-lora \
                 python3 -m torch.distributed.run \
@@ -93,6 +97,13 @@ train_model() {
         HOST_GID=$(stat -c '%g' docker-compose.yml 2>/dev/null || echo "1000")
         chown $HOST_UID:$HOST_GID "$LOG_FILE" 2>/dev/null || true
         chown $HOST_UID:$HOST_GID "$LOG_DIR" 2>/dev/null || true
+    fi
+
+    # 嘗試修復訓練輸出目錄權限（checkpoints 等）
+    if [ -d "finetune_models" ]; then
+        HOST_UID=${HOST_UID:-$(id -u)}
+        HOST_GID=${HOST_GID:-$(id -g)}
+        chown -R $HOST_UID:$HOST_GID finetune_models 2>/dev/null || true
     fi
 
     if [ $? -eq 0 ]; then
