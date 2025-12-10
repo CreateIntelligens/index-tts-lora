@@ -25,7 +25,7 @@ def null_position_embeddings(range, dim):
 
 class ResBlock(nn.Module):
     """
-    Basic residual convolutional block that uses GroupNorm.
+    使用 GroupNorm 的基礎殘差卷積區塊。
     """
 
     def __init__(self, chan):
@@ -43,9 +43,12 @@ class ResBlock(nn.Module):
 
 
 class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
+    """
+    用於推理的 GPT2 模型封裝，支援模型並行與 KV 快取。
+    """
     def __init__(self, config, gpt, text_pos_emb, embeddings, norm, linear, kv_cache=False):
         super().__init__(config)
-        # Note: the argument named `text_pos_emb` here actually represents the mel position embedding
+        # 注意: text_pos_emb 實際代表 Mel 位置編碼
         self.transformer = gpt
         self.text_pos_embedding = text_pos_emb
         self.embeddings = embeddings
@@ -53,7 +56,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
         self.lm_head = nn.Sequential(norm, linear)
         self.kv_cache = kv_cache
 
-        # Model parallel
+        # 模型並行設定
         self.model_parallel = False
         self.device_map = None
         self.cached_mel_emb = None
@@ -88,10 +91,11 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
         self.cached_mel_emb = mel_emb
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
-        token_type_ids = kwargs.get("token_type_ids", None)  # usually None
+        token_type_ids = kwargs.get("token_type_ids", None)
         if not self.kv_cache:
             past_key_values = None
-        # only last token for inputs_ids if past is defined in kwargs
+        
+        # 若存在 past_key_values，僅使用最後一個 Token
         if past_key_values:
             input_ids = input_ids[:, -1].unsqueeze(-1)
             if token_type_ids is not None:
@@ -101,13 +105,14 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
         position_ids = kwargs.get("position_ids", None)
 
         if attention_mask is not None and position_ids is None:
-            # create position_ids on the fly for batch generation
+            # 動態建立 position_ids
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 0)
             if past_key_values:
                 position_ids = position_ids[:, -1].unsqueeze(-1)
         else:
             position_ids = None
+            
         return {
             "input_ids": input_ids,
             "past_key_values": past_key_values,
@@ -135,12 +140,14 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
             return_dict=None,
     ):
         assert self.cached_mel_emb is not None
-        assert inputs_embeds is None  # Not supported by this inference model.
-        assert labels is None  # Training not supported by this inference model.
+        assert inputs_embeds is None  # 推理模型不支援直接輸入 Embeddings
+        assert labels is None  # 推理模型不支援訓練模式
+        
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
         )
-        # Create embedding
+        
+        # 建立 Embedding
         mel_len = self.cached_mel_emb.shape[1]
         if input_ids.shape[1] != 1:
             text_inputs = input_ids[:, mel_len:]
@@ -150,7 +157,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
                 mel_emb = self.cached_mel_emb.repeat_interleave(
                     text_emb.shape[0] // self.cached_mel_emb.shape[0], 0
                 )
-            else:  # this outcome only occurs once per loop in most cases
+            else:
                 mel_emb = self.cached_mel_emb
             emb = torch.cat([mel_emb, text_emb], dim=1)
         else:
@@ -158,6 +165,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
             emb = emb + self.text_pos_embedding.get_fixed_embedding(
                 attention_mask.shape[1] - mel_len, attention_mask.device
             )
+            
         transformer_outputs = self.transformer(
             inputs_embeds=emb,
             past_key_values=past_key_values,
@@ -174,7 +182,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
         )
         hidden_states = transformer_outputs[0]
 
-        # Set device for model parallelism
+        # 設定並行運算裝置
         if self.model_parallel:
             if torch.backends.mps.is_available():
                 self.to(self.transformer.first_device)
@@ -199,9 +207,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel, GenerationMixin):
     @staticmethod
     def _reorder_cache(past, beam_idx):
         """
-        This function is used to re-order the :obj:`past_key_values` cache if
-        :meth:`~transformers.PreTrainedModel.beam_search` or :meth:`~transformers.PreTrainedModel.beam_sample` is
-        called. This is required to match :obj:`past_key_values` with the correct beam_idx at every generation step.
+        重排序 Cache 以支援 Beam Search。
         """
         return tuple(
             tuple(
@@ -237,14 +243,13 @@ class ConditioningEncoder(nn.Module):
             return h.mean(dim=2)
         else:
             return h
-            # return h[:, :, 0]
 
 
 class LearnedPositionEmbeddings(nn.Module):
     def __init__(self, seq_len, model_dim, init=.02):
         super().__init__()
         self.emb = nn.Embedding(seq_len, model_dim)
-        # Initializing this way is standard for GPT-2
+        # GPT-2 標準初始化方式
         self.emb.weight.data.normal_(mean=0.0, std=init)
 
     def forward(self, x):
@@ -257,10 +262,10 @@ class LearnedPositionEmbeddings(nn.Module):
 
 def build_hf_gpt_transformer(layers, model_dim, heads, max_mel_seq_len, max_text_seq_len, checkpointing, activation_function):
     """
-    GPT-2 implemented by the HuggingFace library.
+    建構 HuggingFace GPT-2 Transformer 模型。
     """
     from transformers import GPT2Config, GPT2Model
-    gpt_config = GPT2Config(vocab_size=256,  # Unused.
+    gpt_config = GPT2Config(vocab_size=256,  # 未使用
                             n_positions=max_mel_seq_len + max_text_seq_len,
                             n_ctx=max_mel_seq_len + max_text_seq_len,
                             n_embd=model_dim,
@@ -271,11 +276,12 @@ def build_hf_gpt_transformer(layers, model_dim, heads, max_mel_seq_len, max_text
     gpt = GPT2Model(gpt_config)
     if checkpointing:
         gpt.gradient_checkpointing_enable()
-    # Override the built in positional embeddings
+    
+    # 覆蓋內建的位置與 Token Embeddings
     del gpt.wpe
     gpt.wpe = functools.partial(null_position_embeddings, dim=model_dim)
-    # Built-in token embeddings are unused.
     del gpt.wte
+    
     return gpt, LearnedPositionEmbeddings(max_mel_seq_len, model_dim), LearnedPositionEmbeddings(max_text_seq_len, model_dim), \
         None, None
 
@@ -311,24 +317,15 @@ class UnifiedVoice(nn.Module):
                  checkpointing=True, types=1, activation_function=None,
                  condition_num_latent=32, condition_type="perceiver", condition_module=None):
         """
+        統一語音模型初始化。
+
         Args:
-            layers: Number of layers in transformer stack.
-            model_dim: Operating dimensions of the transformer
-            heads: Number of transformer heads. Must be divisible by model_dim. Recommend model_dim//64
-            max_text_tokens: Maximum number of text tokens that will be encountered by model.
-            max_mel_tokens: Maximum number of MEL tokens that will be encountered by model.
-            max_conditioning_inputs: Maximum number of conditioning inputs provided to the model. If (1), conditioning input can be of format (b,80,s), otherwise (b,n,80,s).
-            mel_length_compression: The factor between <number_input_samples> and <mel_tokens>. Used to compute MEL code padding given wav input length.
-            number_text_tokens:
-            start_text_token:
-            stop_text_token:
-            number_mel_codes:
-            start_mel_token:
-            stop_mel_token:
-            train_solo_embeddings:
-            use_mel_codes_as_input:
-            checkpointing:
-            condition_type: perceiver, gst or default encoder
+            layers: Transformer 層數
+            model_dim: 模型維度
+            heads: 注意力頭數
+            max_text_tokens: 最大文字 Token 數
+            max_mel_tokens: 最大 Mel Token 數
+            condition_type: 條件編碼器類型 ('perceiver', 'conformer_perceiver' 等)
         """
         super().__init__()
         self.number_text_tokens = number_text_tokens
@@ -347,10 +344,11 @@ class UnifiedVoice(nn.Module):
         self.condition_type = condition_type
         self.cond_num = condition_num_latent
         self.cond_mask_pad = nn.ConstantPad1d((self.cond_num, 0), True)
+        
         if condition_type == "perceiver":
             self.conditioning_encoder = ConditioningEncoder(100, model_dim, num_attn_heads=heads)
             self.perceiver_encoder = PerceiverResampler(model_dim, dim_context=model_dim, num_latents=self.cond_num)
-        elif condition_type == "conformer_perceiver" or condition_type == "conformer_encoder":
+        elif condition_type in ["conformer_perceiver", "conformer_encoder"]:
             self.conditioning_encoder = ConformerEncoder(input_size=100,
                                                          output_size=condition_module['output_size'],
                                                          linear_units=condition_module['linear_units'],
@@ -370,9 +368,11 @@ class UnifiedVoice(nn.Module):
             self.mel_embedding = nn.Embedding(self.number_mel_codes, model_dim)
         else:
             self.mel_embedding = MelEncoder(model_dim, resblocks_per_reduction=1)
+            
         self.gpt, self.mel_pos_embedding, self.text_pos_embedding, self.mel_layer_pos_embedding, self.text_layer_pos_embedding = \
             build_hf_gpt_transformer(layers, model_dim, heads, self.max_mel_tokens + 2 + self.max_conditioning_inputs,
                                      self.max_text_tokens + 2, checkpointing, activation_function)
+        
         if train_solo_embeddings:
             self.mel_solo_embedding = nn.Parameter(torch.randn(1, 1, model_dim) * .02, requires_grad=True)
             self.text_solo_embedding = nn.Parameter(torch.randn(1, 1, model_dim) * .02, requires_grad=True)
@@ -384,14 +384,12 @@ class UnifiedVoice(nn.Module):
         self.text_head = nn.Linear(model_dim, self.number_text_tokens * types + 1)
         self.mel_head = nn.Linear(model_dim, self.number_mel_codes)
 
-        # Initialize the embeddings per the GPT-2 scheme
         embeddings = [self.text_embedding]
         if use_mel_codes_as_input:
             embeddings.append(self.mel_embedding)
         for module in embeddings:
             module.weight.data.normal_(mean=0.0, std=.02)
             
-        # 初始化 mean_condition 為 None，後續可以設定
         self.mean_condition = None
 
     def post_init_gpt2_config(self, use_deepspeed=False, kv_cache=False, half=False):
@@ -431,7 +429,6 @@ class UnifiedVoice(nn.Module):
         else:
             self.inference_model = self.inference_model.eval()
 
-        # self.inference_model = PrunedGPT2InferenceModel(gpt_config, self.gpt, self.mel_pos_embedding, self.mel_embedding, self.final_norm, self.mel_head)
         self.gpt.wte = self.mel_embedding
 
     def build_aligned_inputs_and_targets(self, input, start_token, stop_token):
@@ -441,13 +438,9 @@ class UnifiedVoice(nn.Module):
 
     def set_mel_padding(self, mel_input_tokens, mel_lengths):
         """
-        Given mel tokens that are derived from a padded audio clip and the actual lengths of each batch element in
-        that audio clip, reformats the tokens with STOP_MEL_TOKEN in place of the zero padding. This is required
-        preformatting to create a working TTS model.
+        將 Mel Tokens 中的 padding 替換為 STOP_MEL_TOKEN。
         """
         for b in range(len(mel_lengths)):
-            # Due to the convolutional nature of how these tokens are generated,
-            # it would be best if the model predicts a token past the actual last token.
             actual_end = mel_lengths[b]
             if actual_end < mel_input_tokens.shape[-1]:
                 mel_input_tokens[b, actual_end:] = self.stop_mel_token
@@ -455,13 +448,9 @@ class UnifiedVoice(nn.Module):
 
     def set_text_padding(self, text_input_tokens, text_lengths):
         """
-        Given mel tokens that are derived from a padded audio clip and the actual lengths of each batch element in
-        that audio clip, reformats the tokens with STOP_MEL_TOKEN in place of the zero padding. This is required
-        preformatting to create a working TTS model.
+        將 Text Tokens 中的 padding 替換為 STOP_TEXT_TOKEN。
         """
         for b in range(len(text_lengths)):
-            # Due to the convolutional nature of how these tokens are generated,
-            # it would be best if the model predicts a token past the actual last token.
             actual_end = text_lengths[b]
             if actual_end < text_input_tokens.shape[-1]:
                 text_input_tokens[b, actual_end:] = self.stop_text_token
@@ -496,12 +485,10 @@ class UnifiedVoice(nn.Module):
             return first_logits
 
     def get_conditioning(self, speech_conditioning_input, cond_mel_lengths=None, speaker_ids=None):
-        # 如果設定了多說話人的 mean_condition，根據 speaker_id 選擇對應的條件向量
         if speaker_ids is not None:
             batch_size = len(speaker_ids)
             device = speech_conditioning_input.device if speech_conditioning_input is not None else next(self.parameters()).device
             
-            # 為每個樣本選擇對應說話人的 mean_condition
             conds_list = []
             for speaker_id in speaker_ids:
                 param_name = f'mean_condition_{speaker_id}'
@@ -509,30 +496,24 @@ class UnifiedVoice(nn.Module):
                     speaker_condition = getattr(self, param_name)
                     if speaker_condition.device != device:
                         speaker_condition = speaker_condition.to(device)
-                    # 確保是3維張量 (1, 32, dim)
                     if speaker_condition.ndim == 2:
                         speaker_condition = speaker_condition.unsqueeze(0)
                     elif speaker_condition.ndim == 4:
                         speaker_condition = speaker_condition.squeeze(0)
                     conds_list.append(speaker_condition)
                 else:
-                    raise ValueError(f"No condition found for speaker {speaker_id}")
+                    raise ValueError(f"找不到說話人 {speaker_id} 的條件向量")
             
-            # 將所有條件堆疊成批次 (batch_size, 32, dim)
             return torch.cat(conds_list, dim=0)
         
-        # 如果設定了單一的 mean_condition，直接返回固定的條件向量
         if hasattr(self, 'mean_condition') and self.mean_condition is not None:
             batch_size = speech_conditioning_input.shape[0] if speech_conditioning_input is not None else 1
             device = speech_conditioning_input.device if speech_conditioning_input is not None else next(self.parameters()).device
-            # 確保 mean_condition 在正確的裝置上
             if self.mean_condition.device != device:
-                logger.info(f"Warning: mean_condition device mismatch. Moving from {self.mean_condition.device} to {device}")
+                logger.info(f"警告: mean_condition 裝置不符，移動至 {device}")
                 self.mean_condition = self.mean_condition.to(device)
-            # 直接擴充套件到批次大小
             return self.mean_condition.expand(batch_size, -1, -1)
         
-        # 原有的動態計算邏輯
         if self.condition_type == "perceiver":
             if speech_conditioning_input.ndim == 4:
                 speech_conditioning_input = speech_conditioning_input.squeeze(1)
@@ -542,7 +523,6 @@ class UnifiedVoice(nn.Module):
             speech_conditioning_input, mask = self.conditioning_encoder(speech_conditioning_input.transpose(1, 2),
                                                                         cond_mel_lengths)  # (b, s, d), (b, 1, s)
             if self.condition_type == "conformer_perceiver":
-                # conds_mask = torch.cat([torch.ones((mask.shape[0], self.cond_num), dtype=torch.bool), mask.squeeze(1)], dim=1)
                 conds_mask = self.cond_mask_pad(mask.squeeze(1))
                 conds = self.perceiver_encoder(speech_conditioning_input, conds_mask)  # (b, 32, d)
         elif self.condition_type == "gst":
@@ -567,29 +547,20 @@ class UnifiedVoice(nn.Module):
                 cond_mel_lengths=None, types=None, text_first=True, raw_mels=None, return_attentions=False,
                 return_latent=False, clip_inputs=False, speaker_ids=None):
         """
-        Forward pass that uses both text and voice in either text conditioning mode or voice conditioning mode
-        (actuated by `text_first`).
+        前向傳播方法，支援文字條件或語音條件模式。
 
-        speech_conditioning_input: MEL float tensor, (b,1024)
-        text_inputs: long tensor, (b,t)
-        text_lengths: long tensor, (b,)
-        mel_inputs:  long tensor, (b,m)
-        wav_lengths: long tensor, (b,)
-        raw_mels: MEL float tensor (b,80,s)
-
-        If return_attentions is specified, only logits are returned.
-        If return_latent is specified, loss & logits are not computed or returned. Only the predicted latents are returned.
-        If clip_inputs is True, the inputs will be clipped to the smallest input size across each input modality.
+        Args:
+            speech_conditioning_latent: Mel 頻譜圖輸入 (b, 1024)
+            text_inputs: 文字輸入序列 (b, t)
+            mel_codes: Mel 代碼輸入 (b, m)
+            clip_inputs: 是否裁剪輸入至最小尺寸
         """
 
         speech_conditioning_latent = self.get_conditioning(speech_conditioning_latent, cond_mel_lengths, speaker_ids)
-        # Types are expressed by expanding the text embedding space.
         if types is not None:
             text_inputs = text_inputs * (1 + types).unsqueeze(-1)
 
         if clip_inputs:
-            # This model will receive micro-batches with a ton of padding for both the text and MELs. Ameliorate this by
-            # chopping the inputs by the maximum actual length.
             max_text_len = text_lengths.max()
             text_inputs = text_inputs[:, :max_text_len]
             max_mel_len = wav_lengths.max() // self.mel_length_compression
@@ -597,8 +568,6 @@ class UnifiedVoice(nn.Module):
             if raw_mels is not None:
                 raw_mels = raw_mels[:, :, :max_mel_len * 4]
 
-        # Set padding areas within MEL (currently it is coded with the MEL code for <zero>).
-        # mel_codes_lengths = torch.div(wav_lengths, self.mel_length_compression, rounding_mode='trunc')
         mel_codes_lengths = torch.ceil(wav_lengths / self.mel_length_compression).long() + 1
         mel_codes = self.set_mel_padding(mel_codes, mel_codes_lengths)
         text_inputs = self.set_text_padding(text_inputs, text_lengths)
@@ -617,14 +586,13 @@ class UnifiedVoice(nn.Module):
         mel_emb = mel_emb + self.mel_pos_embedding(mel_codes)
 
         if text_first:
-            # print(f"conds: {conds.shape}, text_emb: {text_emb.shape}, mel_emb: {mel_emb.shape}")
             text_logits, mel_logits = self.get_logits(conds, text_emb, self.text_head, mel_emb, self.mel_head, get_attns=return_attentions, return_latent=return_latent)
             if return_latent:
-                return mel_logits[:, :-2]  # Despite the name, these are not logits. Strip off the two tokens added by this forward pass.
+                return mel_logits[:, :-2]
         else:
             mel_logits, text_logits = self.get_logits(conds, mel_emb, self.mel_head, text_emb, self.text_head, get_attns=return_attentions, return_latent=return_latent)
             if return_latent:
-                return text_logits[:, :-2]  # Despite the name, these are not logits. Strip off the two tokens added by this forward pass.
+                return text_logits[:, :-2]
 
         if return_attentions:
             return mel_logits
@@ -640,20 +608,20 @@ class UnifiedVoice(nn.Module):
     ):
         
         """
-        Prepare the inputs for the GPT2InferenceModel to generate.
+        準備 GPT2InferenceModel 的生成輸入。
+
         Args:
-            conds_latent: (b, 32, dim) audio conditioning embedding by `get_conditioning()`
-            text_inputs: (b, L)
+            conds_latent: 音訊條件嵌入 (b, 32, dim)
+            text_inputs: 文字輸入 (b, L)
+        
         Returns:
-            input_ids: (b, s+1) the input ids for the GPT2InferenceModel.generate()
-            inputs_embeds: (b, s+1, dim) the input embeddings for the GPT2InferenceModel.forward()
-            attention_mask: (b, s+1) the attention mask for the GPT2InferenceModel.generate()
+            input_ids, inputs_embeds, attention_mask
         """
         b, L = text_inputs.shape[:2]
         device = text_inputs.device
         single_cond = conditional_latents.ndim == 3 and conditional_latents.shape[0] == 1
         if not single_cond:
-            assert conditional_latents.shape[0] == b, f"batch size mismatch: {conditional_latents.shape[0]} vs {b}"
+            assert conditional_latents.shape[0] == b, f"Batch size 不符: {conditional_latents.shape[0]} vs {b}"
         batched_mel_emb = []
         attention_masks = []
         target_len = conditional_latents.shape[1] + L + 2
@@ -664,49 +632,47 @@ class UnifiedVoice(nn.Module):
             text_input = F.pad(text_input, (0, 1), value=self.stop_text_token)
             text_input_pos = torch.arange(0, text_input.size(-1), device=device)
             text_emb = self.text_embedding(text_input) + self.text_pos_embedding.emb(text_input_pos)
-            # concatenate [conditional latents][text embeddings]
+            
             conds_text_emb = [
                 conditional_latents.squeeze(0) if single_cond else conditional_latents[i],
                 text_emb,
             ]
-            # +1 for the start_mel_token
+            
             attention_mask = torch.ones(target_len+1, dtype=torch.long, device=device)
-            # check this text input is padded
             padding: int = L + 2 - text_input.size(-1)
-            # pad left of [cond][text] -> [pad][cond][text]
+            
             if padding > 0:
-                pad = torch.zeros((padding, conditional_latents.size(-1)), dtype=text_emb.dtype, device=device) # [p, dim]
+                pad = torch.zeros((padding, conditional_latents.size(-1)), dtype=text_emb.dtype, device=device)
                 conds_text_emb.insert(0, pad)
                 attention_mask[:padding] = 0
-            mel_emb = torch.cat(conds_text_emb) #[s, dim]
+            mel_emb = torch.cat(conds_text_emb)
             assert mel_emb.shape[0] == target_len, f"mel_emb.shape: {mel_emb.shape}, target_len: {target_len}"
             batched_mel_emb.append(mel_emb)
             attention_masks.append(attention_mask)
-        # [b, s, dim]
+        
         batched_mel_emb = torch.stack(batched_mel_emb, dim=0)
-        # [b, s+1]
         attention_mask = torch.stack(attention_masks, dim=0)
-        # [b, s+1]
+        
         fake_inputs = torch.ones(
             (
                 batched_mel_emb.shape[0],
-                batched_mel_emb.shape[1] + 1,  # +1 for the start_mel_token
+                batched_mel_emb.shape[1] + 1,
             ),
             dtype=torch.long,
             device=device,
         )
         fake_inputs[:, -1] = self.start_mel_token
         return fake_inputs, batched_mel_emb, attention_mask
+
     def inference_speech(self, speech_conditioning_mel, text_inputs, cond_mel_lengths=None, input_tokens=None, num_return_sequences=1,
                          max_generate_length=None, typical_sampling=False, typical_mass=.9, speaker_ids=None, **hf_generate_kwargs):
         """
+        執行語音推論生成。
+
         Args:
-            speech_conditioning_mel: (b, n_mels, frames) or (n_mels, frames)
-            text_inputs: (b, L)
-            cond_mel_lengths: lengths of the conditioning mel spectrograms in shape (b,) or (1,)
-            input_tokens: additional tokens for generation in shape (b, s) or (s,)
-            max_generate_length: limit the number of generated tokens
-            hf_generate_kwargs: kwargs for `GPT2InferenceModel.generate(**hf_generate_kwargs)`
+            speech_conditioning_mel: 條件 Mel 頻譜圖
+            text_inputs: 文字輸入
+            max_generate_length: 生成長度限制
         """
         if speech_conditioning_mel.ndim == 2:
             speech_conditioning_mel = speech_conditioning_mel.unsqueeze(0)
@@ -721,9 +687,9 @@ class UnifiedVoice(nn.Module):
             if input_tokens.ndim == 1:
                 input_tokens = input_tokens.unsqueeze(0)
             assert num_return_sequences % input_tokens.shape[0] == 0, \
-                    "The num_return_sequences must be divisible by the batch number of input_tokens"
+                    "num_return_sequences 必須能被 input_tokens 的 Batch size 整除"
             assert num_return_sequences % text_inputs.shape[0] == 0, \
-                    "The num_return_sequences must be divisible by the batch number of text_inputs"
+                    "num_return_sequences 必須能被 text_inputs 的 Batch size 整除"
             b = num_return_sequences // input_ids.shape[0]
             if b > 1:
                 input_ids = input_ids.repeat(b, 1)
@@ -734,9 +700,8 @@ class UnifiedVoice(nn.Module):
         trunc_index = inputs.shape[1]
         logits_processor = LogitsProcessorList()
         if typical_sampling:
-            # employ custom typical sampling
             if not (typical_mass > 0.0 and typical_mass < 1.0):
-                raise ValueError(f"`typical_mass` has to be a float > 0 and < 1, but is {typical_mass}")
+                raise ValueError(f"`typical_mass` 必須在 0 和 1 之間，但得到 {typical_mass}")
             min_tokens_to_keep = 2 if hf_generate_kwargs.get("num_beams", 1) > 1 else 1
             logits_processor.append(TypicalLogitsWarper(mass=typical_mass, min_tokens_to_keep=min_tokens_to_keep))
         max_length = (trunc_index + self.max_mel_tokens - 1) if max_generate_length is None else trunc_index + max_generate_length

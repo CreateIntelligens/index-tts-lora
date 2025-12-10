@@ -23,21 +23,22 @@ import torch.nn.functional as F
 
 
 class PositionalEncoding(torch.nn.Module):
-    """Positional encoding.
+    """
+    位置編碼 (Positional Encoding)。
 
-    :param int d_model: embedding dim
-    :param float dropout_rate: dropout rate
-    :param int max_len: maximum input length
+    使用正弦和餘弦函數生成位置編碼。
 
-    PE(pos, 2i)   = sin(pos/(10000^(2i/dmodel)))
-    PE(pos, 2i+1) = cos(pos/(10000^(2i/dmodel)))
+    Args:
+        d_model (int): 嵌入維度。
+        dropout_rate (float): Dropout 比率。
+        max_len (int): 最大輸入長度。
+        reverse (bool): 是否反轉 (通常不用於標準 PE)。
     """
     def __init__(self,
                  d_model: int,
                  dropout_rate: float,
                  max_len: int = 5000,
                  reverse: bool = False):
-        """Construct an PositionalEncoding object."""
         super().__init__()
         self.d_model = d_model
         self.xscale = math.sqrt(self.d_model)
@@ -58,15 +59,15 @@ class PositionalEncoding(torch.nn.Module):
                 x: torch.Tensor,
                 offset: Union[int, torch.Tensor] = 0) \
             -> Tuple[torch.Tensor, torch.Tensor]:
-        """Add positional encoding.
+        """
+        添加位置編碼。
 
         Args:
-            x (torch.Tensor): Input. Its shape is (batch, time, ...)
-            offset (int, torch.tensor): position offset
+            x (torch.Tensor): 輸入張量 (#batch, time, ...)。
+            offset (Union[int, torch.Tensor]): 位置偏移量。
 
         Returns:
-            torch.Tensor: Encoded tensor. Its shape is (batch, time, ...)
-            torch.Tensor: for compatibility to RelPositionalEncoding
+            Tuple[torch.Tensor, torch.Tensor]: 編碼後的張量與位置嵌入張量。
         """
 
         self.pe = self.pe.to(x.device)
@@ -76,35 +77,28 @@ class PositionalEncoding(torch.nn.Module):
 
     def position_encoding(self, offset: Union[int, torch.Tensor], size: int,
                           apply_dropout: bool = True) -> torch.Tensor:
-        """ For getting encoding in a streaming fashion
-
-        Attention!!!!!
-        we apply dropout only once at the whole utterance level in a none
-        streaming way, but will call this function several times with
-        increasing input size in a streaming scenario, so the dropout will
-        be applied several times.
+        """
+        以串流方式獲取位置編碼。
 
         Args:
-            offset (int or torch.tensor): start offset
-            size (int): required size of position encoding
+            offset (Union[int, torch.Tensor]): 起始偏移量。
+            size (int): 所需的位置編碼長度。
+            apply_dropout (bool): 是否應用 Dropout。
 
         Returns:
-            torch.Tensor: Corresponding encoding
+            torch.Tensor: 對應的位置編碼。
         """
-        # How to subscript a Union type:
-        #   https://github.com/pytorch/pytorch/issues/69434
         if isinstance(offset, int):
             assert offset + size < self.max_len
             pos_emb = self.pe[:, offset:offset + size]
         elif isinstance(offset, torch.Tensor) and offset.dim() == 0:  # scalar
             assert offset + size < self.max_len
             pos_emb = self.pe[:, offset:offset + size]
-        else:  # for batched streaming decoding on GPU
+        else:
             assert torch.max(offset) + size < self.max_len
             index = offset.unsqueeze(1) + \
                 torch.arange(0, size).to(offset.device)  # B X T
             flag = index > 0
-            # remove negative offset
             index = index * flag
             pos_emb = F.embedding(index, self.pe[0])  # B X T X d_model
 
@@ -113,27 +107,32 @@ class PositionalEncoding(torch.nn.Module):
         return pos_emb
 
 class RelPositionalEncoding(PositionalEncoding):
-    """Relative positional encoding module.
-    See : Appendix B in https://arxiv.org/abs/1901.02860
+    """
+    相對位置編碼模組 (Relative Positional Encoding)。
+    
+    參考: https://arxiv.org/abs/1901.02860 Appendix B
+
     Args:
-        d_model (int): Embedding dimension.
-        dropout_rate (float): Dropout rate.
-        max_len (int): Maximum input length.
+        d_model (int): 嵌入維度。
+        dropout_rate (float): Dropout 比率。
+        max_len (int): 最大輸入長度。
     """
     def __init__(self, d_model: int, dropout_rate: float, max_len: int = 5000):
-        """Initialize class."""
         super().__init__(d_model, dropout_rate, max_len, reverse=True)
 
     def forward(self,
                 x: torch.Tensor,
                 offset: Union[int, torch.Tensor] = 0) \
             -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute positional encoding.
+        """
+        計算位置編碼。
+
         Args:
-            x (torch.Tensor): Input tensor (batch, time, `*`).
+            x (torch.Tensor): 輸入張量 (batch, time, *)。
+            offset: 偏移量。
+
         Returns:
-            torch.Tensor: Encoded tensor (batch, time, `*`).
-            torch.Tensor: Positional embedding tensor (1, time, `*`).
+            Tuple[torch.Tensor, torch.Tensor]: 編碼後的張量與位置嵌入。
         """
         self.pe = self.pe.to(x.device)
         x = x * self.xscale
@@ -142,7 +141,8 @@ class RelPositionalEncoding(PositionalEncoding):
 
 
 class NoPositionalEncoding(torch.nn.Module):
-    """ No position encoding
+    """
+    無位置編碼 (No Positional Encoding)。
     """
     def __init__(self, d_model: int, dropout_rate: float):
         super().__init__()
@@ -153,7 +153,8 @@ class NoPositionalEncoding(torch.nn.Module):
                 x: torch.Tensor,
                 offset: Union[int, torch.Tensor] = 0) \
             -> Tuple[torch.Tensor, torch.Tensor]:
-        """ Just return zero vector for interface compatibility
+        """
+        僅返回零向量以保持介面相容性。
         """
         pos_emb = torch.zeros(1, x.size(1), self.d_model).to(x.device)
         return self.dropout(x), pos_emb

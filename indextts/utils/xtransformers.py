@@ -22,7 +22,7 @@ LayerIntermediates = namedtuple('Intermediates', [
 ])
 
 
-# helpers
+# 輔助函式
 
 def exists(val):
     return val is not None
@@ -70,7 +70,7 @@ def l2norm(t):
     return F.normalize(t, p=2, dim=-1)
 
 
-# init helpers
+# 初始化輔助函式
 
 def init_zero_(layer):
     nn.init.constant_(layer.weight, 0.)
@@ -78,7 +78,7 @@ def init_zero_(layer):
         nn.init.constant_(layer.bias, 0.)
 
 
-# keyword argument helpers
+# 關鍵字參數輔助函式
 
 def pick_and_pop(keys, d):
     values = list(map(lambda key: d.pop(key), keys))
@@ -108,14 +108,14 @@ def groupby_prefix_and_trim(prefix, d):
     return kwargs_without_prefix, kwargs
 
 
-# activations
+# 激活函式
 
 class ReluSquared(nn.Module):
     def forward(self, x):
         return F.relu(x) ** 2
 
 
-# positional embeddings
+# 位置嵌入 (Positional Embeddings)
 
 class AbsolutePositionalEmbedding(nn.Module):
     def __init__(self, dim, max_seq_len):
@@ -362,7 +362,7 @@ class RMSScaleShiftNorm(nn.Module):
         return h
 
 
-# residual and residual gates
+# 殘差與門控殘差
 
 class Residual(nn.Module):
     def __init__(self, dim, scale_residual=False):
@@ -394,7 +394,7 @@ class GRUGating(nn.Module):
         return gated_output.reshape_as(x)
 
 
-# token shifting
+# Token 位移
 
 def shift(t, amount, mask=None):
     if amount == 0:
@@ -424,7 +424,7 @@ class ShiftTokens(nn.Module):
         return self.fn(x, **kwargs)
 
 
-# feedforward
+# 前饋網路
 
 class GLU(nn.Module):
     def __init__(self, dim_in, dim_out, activation):
@@ -466,7 +466,7 @@ class FeedForward(nn.Module):
             nn.Linear(inner_dim, dim_out)
         )
 
-        # init last linear layer to 0
+        # 將最後一個線性層初始化為 0
         if zero_init_output:
             init_zero_(self.net[-1])
 
@@ -474,7 +474,7 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 
-# attention.
+# 注意力機制
 
 class Attention(nn.Module):
     def __init__(

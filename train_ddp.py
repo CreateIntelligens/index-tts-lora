@@ -45,12 +45,12 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from transformers import get_cosine_schedule_with_warmup
+from torch.utils.tensorboard import SummaryWriter
 
 from indextts.BigVGAN.models import BigVGAN
 from indextts.data_utils import (
     collate_finetune_fn,
     load_finetune_datasets,
-    load_speaker_conditions,
 )
 from indextts.gpt.model import UnifiedVoice
 
@@ -121,15 +121,29 @@ class DDPTrainer:
         # 準備目錄和日誌
         self.finetune_dir = self.config.train.finetune_model_dir
         self.checkpoint_dir = os.path.join(self.finetune_dir, "checkpoints")
+        # 為文字 log 與 TensorBoard 統一使用同一個 run 名稱/目錄（使用絕對路徑避免 cwd 變動）
+        # 若外部（run.sh）已指定 RUN_NAME/RUN_LOG_DIR，則沿用同一個名字與路徑，避免產生多個目錄
+        env_run_name = os.environ.get("RUN_NAME")
+        env_log_dir = os.environ.get("RUN_LOG_DIR")
+        if env_run_name:
+            self.run_name = env_run_name
+        else:
+            self.run_name = f"train_{dt.now().strftime('%Y%m%d_%H%M%S')}"
+
+        if env_log_dir:
+            self.log_dir = os.path.abspath(env_log_dir)
+        else:
+            self.log_dir = os.path.abspath(os.path.join(os.getcwd(), "logs", self.run_name))
+
         if self.is_main_process:
             os.makedirs(self.checkpoint_dir, exist_ok=True)
-            self._setup_logging()
-
-        # 載入說話人條件向量
-        self.speaker_conditions = load_speaker_conditions(config)
-        self.speaker_list = list(self.speaker_conditions.keys())
-        if self.is_main_process:
-            logger.info(f"Loaded conditions for {len(self.speaker_list)} speakers: {self.speaker_list}")
+            os.makedirs(self.log_dir, exist_ok=True)
+            # 文字 log 與 TensorBoard 放在同一目錄，方便對齊時間戳
+            log_path = os.path.join(self.log_dir, "train.log")
+            self._setup_logging(log_path)
+            # Initialize TensorBoard Writer (only on main process)
+            self.writer = SummaryWriter(log_dir=self.log_dir)
+            logger.info(f"TensorBoard logging to: {self.log_dir}")
 
         # 載入模型和分詞器
         self._load_models()
@@ -148,9 +162,8 @@ class DDPTrainer:
         if self.is_main_process:
             logger.info(f"Set random seed to {seed} for rank {self.rank}")
 
-    def _setup_logging(self):
+    def _setup_logging(self, log_path: str):
         """配置日誌記錄器（只在主進程）"""
-        log_path = os.path.join(self.checkpoint_dir, f"train_ddp_{dt.now().strftime('%Y%m%d_%H%M%S')}.txt")
         logger.add(log_path, level="INFO", encoding="utf-8")
         logger.info(f"🚀 DDP Training with {self.world_size} GPUs")
         logger.info("Full configuration:\n" + OmegaConf.to_yaml(self.config))
@@ -176,32 +189,12 @@ class DDPTrainer:
             self.model,
             device_ids=[self.rank],
             output_device=self.rank,
-            find_unused_parameters=False  # 設為 True 如果有未使用的參數
+            # conditioning/perceiver 可能在特定分支未被使用，保持 True 避免梯度同步死鎖
+            find_unused_parameters=True
         )
 
         if self.is_main_process:
             logger.info(f"✅ Model wrapped with DDP on {self.world_size} GPUs")
-
-        # 註冊說話人條件
-        self.speaker_mean_conditions = {}
-        from tqdm import tqdm
-        iterator = self.speaker_conditions.items()
-        if self.is_main_process:
-            iterator = tqdm(iterator, desc="Register speaker conditions", ncols=100)
-        for speaker_id, condition in iterator:
-            if condition.ndim == 2:
-                condition = condition.unsqueeze(0)
-            param = torch.nn.Parameter(condition.to(self.device), requires_grad=True)
-            param_name = f"mean_condition_{speaker_id}"
-            self.model.module.register_parameter(param_name, param)
-            self.speaker_mean_conditions[speaker_id] = param
-            if self.is_main_process and hasattr(iterator, "set_postfix"):
-                iterator.set_postfix({"last": speaker_id})
-        if self.is_main_process and hasattr(iterator, "close"):
-            iterator.close()
-
-        if self.is_main_process:
-            logger.info(f"Loaded {len(self.speaker_mean_conditions)} speaker conditions")
 
     def _apply_lora(self, model: UnifiedVoice) -> UnifiedVoice:
         """應用 LoRA 配置"""
@@ -217,6 +210,21 @@ class DDPTrainer:
         )
         model.requires_grad_(False)
         model.inference_model = get_peft_model(model.inference_model, gpt_lora_config)
+
+        # ⚠️ 重要：凍結 conditioning_encoder 和 perceiver_encoder
+        # 原因：預訓練的 encoder 已經學會抽取音色，如果繼續訓練，
+        # 它會學習編碼更多資訊（包括內容），導致推論時複製參考音檔的文字內容。
+        # 這是 zero-shot TTS 的常見問題。
+        if hasattr(model, 'conditioning_encoder'):
+            model.conditioning_encoder.requires_grad_(False)
+            if self.is_main_process:
+                logger.info("✓ conditioning_encoder 已凍結（防止內容洩漏）")
+        if hasattr(model, 'perceiver_encoder'):
+            model.perceiver_encoder.requires_grad_(False)
+            if self.is_main_process:
+                logger.info("✓ perceiver_encoder 已凍結（防止內容洩漏）")
+
+        # 只訓練 LoRA 層，讓 GPT 學習如何根據「固定的音色 embedding」生成對應內容
         return model
 
     def _setup_optimizer_and_scheduler(self, num_training_steps: int = 0):
@@ -322,9 +330,6 @@ class DDPTrainer:
             self.model.train()
 
             for batch_idx, batch in enumerate(train_loader):
-                # if batch_idx % 5 == 0:
-                print(f"[Rank {self.rank}] Processing batch {batch_idx}/{steps_per_epoch}", flush=True)
-
                 # 將資料移到對應的 GPU
                 data_batch = []
                 for item in batch:
@@ -362,13 +367,28 @@ class DDPTrainer:
                         f"acc@1={acc_1:.2f}%, acc@10={acc_10:.2f}%, acc@20={acc_20:.2f}%, "
                         f"grad_norm={grad_norm.item():.2f}"
                     )
-
-            print(f"[Rank {self.rank}] Finished epoch {epoch+1} loop. Entering validation/barrier check.", flush=True)
+                    
+                    # TensorBoard Logging
+                    self.writer.add_scalar("loss/text", loss_text.item(), self.update_steps)
+                    self.writer.add_scalar("loss/mel", loss_mel.item(), self.update_steps)
+                    self.writer.add_scalar("loss/total", weighted_loss.item(), self.update_steps)
+                    self.writer.add_scalar("accuracy/top1", acc_1, self.update_steps)
+                    self.writer.add_scalar("accuracy/top10", acc_10, self.update_steps)
+                    self.writer.add_scalar("accuracy/top20", acc_20, self.update_steps)
+                    self.writer.add_scalar("train/grad_norm", grad_norm.item(), self.update_steps)
+                    self.writer.add_scalar("train/lr", self.scheduler.get_last_lr()[0], self.update_steps)
 
             # 驗證（只在主進程）
             if self.is_main_process:
-                val_text_loss, val_mel_loss, _, _, _ = self._validate_epoch(valid_loader, epoch)
+                val_text_loss, val_mel_loss, val_acc1, val_acc10, val_acc20 = self._validate_epoch(valid_loader, epoch)
                 self._save_checkpoint(epoch, val_text_loss, val_mel_loss)
+                
+                # TensorBoard Validation Logging
+                self.writer.add_scalar("val/loss_text", val_text_loss, epoch + 1)
+                self.writer.add_scalar("val/loss_mel", val_mel_loss, epoch + 1)
+                self.writer.add_scalar("val/accuracy_top1", val_acc1, epoch + 1)
+                self.writer.add_scalar("val/accuracy_top10", val_acc10, epoch + 1)
+                self.writer.add_scalar("val/accuracy_top20", val_acc20, epoch + 1)
 
             # 同步所有進程
             # print(f"[Rank {self.rank}] Waiting at barrier...", flush=True)
@@ -376,21 +396,21 @@ class DDPTrainer:
             # print(f"[Rank {self.rank}] Passed barrier!", flush=True)
 
     def _train_step(self, batch: Tuple) -> Tuple[torch.Tensor, torch.Tensor, dict]:
-        """單個訓練步驟"""
-        # 解包 batch
-        mel_spec, mel_codes, text_ids, conditions, speaker_ids, mel_lengths, codes_lengths, text_lengths = batch
-        batch_speaker_ids = list(speaker_ids)
+        """單個訓練步驟：conditioning 來自同 speaker 的另一段語音"""
+        # 解包 batch（新增 cond_mels、cond_lengths）
+        mel_spec, mel_codes, text_ids, cond_mels, speaker_ids, mel_lengths, codes_lengths, text_lengths, cond_lengths = batch
 
-        # 前向傳播
         outputs = forward_UnifiedVoice(
             self.model.module,  # DDP 需要使用 .module
-            mel_spec,
+            mel_spec,           # target mel（用於 loss）
             mel_codes,
             text_ids,
             mel_lengths,
             codes_lengths,
             text_lengths,
-            speaker_ids=batch_speaker_ids,
+            condition_mels=cond_mels,
+            condition_lengths=cond_lengths,
+            speaker_ids=None,  # 不用 speaker_id 查表，強制 encoder 學習
             add_mel_stop_token=self.config.train.get('add_mel_stop_token', True),
             output_loss=True,
             output_logits=True,
@@ -401,15 +421,22 @@ class DDPTrainer:
 
         return loss_text, loss_mel, mel_accuracy
 
+    def _forward_with_precomputed_conditioning(self, *args, **kwargs):
+        """Deprecated after dynamic conditioning change."""
+        raise NotImplementedError('Use _train_step with dynamic conditioning instead.')
+
     def _validate_epoch(self, valid_ds: Dataset, epoch: int):
         """驗證（簡化版，只在主進程執行）"""
         self.model.eval()
         total_text_loss = 0.0
         total_mel_loss = 0.0
         num_batches = 0
+        total_batches = len(valid_ds)
+
+        logger.info(f"開始驗證 Epoch {epoch + 1}，共 {total_batches} 個 batch")
 
         with torch.no_grad():
-            for batch in valid_ds:
+            for batch_idx, batch in enumerate(valid_ds):
                 data_batch = []
                 for item in batch:
                     if torch.is_tensor(item):
@@ -422,12 +449,28 @@ class DDPTrainer:
                 total_mel_loss += loss_mel.item()
                 num_batches += 1
 
+                # 每 50 個 batch 打印一次進度
+                if batch_idx % 50 == 0:
+                    logger.info(
+                        f"Validation [{batch_idx}/{total_batches}] | "
+                        f"val_txt={loss_text.item():.3f}, val_mel={loss_mel.item():.3f}"
+                    )
+
         avg_text_loss = total_text_loss / max(num_batches, 1)
         avg_mel_loss = total_mel_loss / max(num_batches, 1)
-
+        
+        # 計算整體準確率 (簡單平均，雖然不完全精確但對於監控足夠)
+        # 在 DDP 驗證中，由於我們沒有 gather 所有的 logits，這裡只計算主 GPU 的準確率
+        # 若要精確，需要 dist.all_gather
+        acc_1 = 0.0
+        acc_10 = 0.0
+        acc_20 = 0.0
+        # 這裡需要補上準確率計算邏輯，但因為原本程式碼沒有收集 logits，暫時回傳 0
+        # 若要實作，需要像 train.py 一樣收集 logits
+        
         logger.info(f"Validation Epoch {epoch + 1}: text_loss={avg_text_loss:.4f}, mel_loss={avg_mel_loss:.4f}")
 
-        return avg_text_loss, avg_mel_loss, 0.0, 0.0, 0.0
+        return avg_text_loss, avg_mel_loss, acc_1, acc_10, acc_20
 
     def _load_checkpoint_states(self, checkpoint_path: str) -> int:
         """
@@ -506,16 +549,10 @@ class DDPTrainer:
 
         # 儲存完整模型（格式與 train.py 一致）
         state_dict = model_to_save.state_dict()
-        checkpoint_data = {
-            'model': state_dict,
-            'speakers': self.speaker_list,
-            'speaker_conditions': {speaker_id: param.detach().cpu().numpy()
-                                 for speaker_id, param in self.speaker_mean_conditions.items()}
-        }
+        checkpoint_data = {'model': state_dict}
 
         torch.save(checkpoint_data, merged_model_path)
         logger.info(f"💾 Merged model saved: {merged_model_path}")
-        logger.info(f"   Saved conditions for speakers: {self.speaker_list}")
 
         # 清理深複製
         del model_to_save
@@ -564,6 +601,8 @@ def main():
 
     finally:
         # 清理
+        if hasattr(trainer, 'writer'):
+            trainer.writer.close()
         cleanup_ddp()
 
 

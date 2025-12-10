@@ -18,16 +18,16 @@ from indextts.utils.common import make_pad_mask
 
 
 class PositionwiseFeedForward(torch.nn.Module):
-    """Positionwise feed forward layer.
+    """
+    逐位置前饋網路 (Positionwise Feed-Forward Network)。
 
-    FeedForward are appied on each position of the sequence.
-    The output dim is same with the input dim.
+    此模組獨立應用於序列的每個位置，輸入與輸出維度相同。
 
     Args:
-        idim (int): Input dimenstion.
-        hidden_units (int): The number of hidden units.
-        dropout_rate (float): Dropout rate.
-        activation (torch.nn.Module): Activation function
+        idim (int): 輸入維度。
+        hidden_units (int): 隱藏層單元數量。
+        dropout_rate (float): Dropout 比率。
+        activation (torch.nn.Module): 激活函數。
     """
 
     def __init__(self,
@@ -35,7 +35,6 @@ class PositionwiseFeedForward(torch.nn.Module):
                  hidden_units: int,
                  dropout_rate: float,
                  activation: torch.nn.Module = torch.nn.ReLU()):
-        """Construct a PositionwiseFeedForward object."""
         super(PositionwiseFeedForward, self).__init__()
         self.w_1 = torch.nn.Linear(idim, hidden_units)
         self.activation = activation
@@ -43,29 +42,34 @@ class PositionwiseFeedForward(torch.nn.Module):
         self.w_2 = torch.nn.Linear(hidden_units, idim)
 
     def forward(self, xs: torch.Tensor) -> torch.Tensor:
-        """Forward function.
+        """
+        前向傳播。
 
         Args:
-            xs: input tensor (B, L, D)
+            xs: 輸入張量 (B, L, D)
         Returns:
-            output tensor, (B, L, D)
+            輸出張量 (B, L, D)
         """
         return self.w_2(self.dropout(self.activation(self.w_1(xs))))
 
 
 class ConvolutionModule(nn.Module):
-    """ConvolutionModule in Conformer model."""
+    """
+    Conformer 模型中的卷積模組。
+    """
 
     def __init__(self,
                  channels: int,
                  kernel_size: int = 15,
                  activation: nn.Module = nn.ReLU(),
                  bias: bool = True):
-        """Construct an ConvolutionModule object.
+        """
+        建構卷積模組。
+
         Args:
-            channels (int): The number of channels of conv layers.
-            kernel_size (int): Kernel size of conv layers.
-            causal (int): Whether use causal convolution or not
+            channels (int): 卷積層的通道數。
+            kernel_size (int): 卷積核大小。
+            bias (bool): 是否使用偏置。
         """
         super().__init__()
 
@@ -77,11 +81,8 @@ class ConvolutionModule(nn.Module):
             padding=0,
             bias=bias,
         )
-        # self.lorder is used to distinguish if it's a causal convolution,
-        # if self.lorder > 0: it's a causal convolution, the input will be
-        #    padded with self.lorder frames on the left in forward.
-        # else: it's a symmetrical convolution
-        # kernel_size should be an odd number for none causal convolution
+        
+        # kernel_size 必須為奇數以確保對稱卷積
         assert (kernel_size - 1) % 2 == 0
         padding = (kernel_size - 1) // 2
         self.lorder = 0
@@ -115,42 +116,38 @@ class ConvolutionModule(nn.Module):
             mask_pad: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
             cache: torch.Tensor = torch.zeros((0, 0, 0)),
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute convolution module.
-        Args:
-            x (torch.Tensor): Input tensor (#batch, time, channels).
-            mask_pad (torch.Tensor): used for batch padding (#batch, 1, time),
-                (0, 0, 0) means fake mask.
-            cache (torch.Tensor): left context cache, it is only
-                used in causal convolution (#batch, channels, cache_t),
-                (0, 0, 0) meas fake cache.
-        Returns:
-            torch.Tensor: Output tensor (#batch, time, channels).
         """
-        # exchange the temporal dimension and the feature dimension
+        計算卷積模組。
+
+        Args:
+            x (torch.Tensor): 輸入張量 (#batch, time, channels)。
+            mask_pad (torch.Tensor): 用於批次填充的遮罩 (#batch, 1, time)。
+            cache (torch.Tensor): 左側上下文快取 (僅用於因果卷積)。
+
+        Returns:
+            torch.Tensor: 輸出張量 (#batch, time, channels)。
+        """
+        # 交換時間與特徵維度
         x = x.transpose(1, 2)  # (#batch, channels, time)
 
-        # mask batch padding
-        if mask_pad.size(2) > 0:  # time > 0
+        if mask_pad.size(2) > 0:
             x.masked_fill_(~mask_pad, 0.0)
 
         if self.lorder > 0:
-            if cache.size(2) == 0:  # cache_t == 0
+            if cache.size(2) == 0:
                 x = nn.functional.pad(x, (self.lorder, 0), 'constant', 0.0)
             else:
-                assert cache.size(0) == x.size(0)  # equal batch
-                assert cache.size(1) == x.size(1)  # equal channel
+                assert cache.size(0) == x.size(0)
+                assert cache.size(1) == x.size(1)
                 x = torch.cat((cache, x), dim=2)
             assert (x.size(2) > self.lorder)
             new_cache = x[:, :, -self.lorder:]
         else:
-            # It's better we just return None if no cache is required,
-            # However, for JIT export, here we just fake one tensor instead of
-            # None.
             new_cache = torch.zeros((0, 0, 0), dtype=x.dtype, device=x.device)
 
-        # GLU mechanism
-        x = self.pointwise_conv1(x)  # (batch, 2*channel, dim)
-        x = nn.functional.glu(x, dim=1)  # (batch, channel, dim)
+        # GLU 機制
+        x = self.pointwise_conv1(x)
+        x = nn.functional.glu(x, dim=1)
 
         # 1D Depthwise Conv
         x = self.depthwise_conv(x)
@@ -160,35 +157,26 @@ class ConvolutionModule(nn.Module):
         if self.use_layer_norm:
             x = x.transpose(1, 2)
         x = self.pointwise_conv2(x)
-        # mask batch padding
-        if mask_pad.size(2) > 0:  # time > 0
+        
+        if mask_pad.size(2) > 0:
             x.masked_fill_(~mask_pad, 0.0)
 
         return x.transpose(1, 2), new_cache
 
 
 class ConformerEncoderLayer(nn.Module):
-    """Encoder layer module.
+    """
+    Conformer 編碼器層模組。
+
     Args:
-        size (int): Input dimension.
-        self_attn (torch.nn.Module): Self-attention module instance.
-            `MultiHeadedAttention` or `RelPositionMultiHeadedAttention`
-            instance can be used as the argument.
-        feed_forward (torch.nn.Module): Feed-forward module instance.
-            `PositionwiseFeedForward` instance can be used as the argument.
-        feed_forward_macaron (torch.nn.Module): Additional feed-forward module
-             instance.
-            `PositionwiseFeedForward` instance can be used as the argument.
-        conv_module (torch.nn.Module): Convolution module instance.
-            `ConvlutionModule` instance can be used as the argument.
-        dropout_rate (float): Dropout rate.
-        normalize_before (bool):
-            True: use layer_norm before each sub-block.
-            False: use layer_norm after each sub-block.
-        concat_after (bool): Whether to concat attention layer's input and
-            output.
-            True: x -> x + linear(concat(x, att(x)))
-            False: x -> x + att(x)
+        size (int): 輸入維度。
+        self_attn (torch.nn.Module): 自注意力模組實例。
+        feed_forward (torch.nn.Module): 前饋模組實例。
+        feed_forward_macaron (torch.nn.Module): 額外的 Macaron 風格前饋模組實例。
+        conv_module (torch.nn.Module): 卷積模組實例。
+        dropout_rate (float): Dropout 比率。
+        normalize_before (bool): 是否在子區塊之前使用 LayerNorm。
+        concat_after (bool): 是否將注意力層的輸入與輸出串聯。
     """
 
     def __init__(
@@ -202,24 +190,21 @@ class ConformerEncoderLayer(nn.Module):
         normalize_before: bool = True,
         concat_after: bool = False,
     ):
-        """Construct an EncoderLayer object."""
         super().__init__()
         self.self_attn = self_attn
         self.feed_forward = feed_forward
         self.feed_forward_macaron = feed_forward_macaron
         self.conv_module = conv_module
-        self.norm_ff = nn.LayerNorm(size, eps=1e-5)  # for the FNN module
-        self.norm_mha = nn.LayerNorm(size, eps=1e-5)  # for the MHA module
+        self.norm_ff = nn.LayerNorm(size, eps=1e-5)
+        self.norm_mha = nn.LayerNorm(size, eps=1e-5)
         if feed_forward_macaron is not None:
             self.norm_ff_macaron = nn.LayerNorm(size, eps=1e-5)
             self.ff_scale = 0.5
         else:
             self.ff_scale = 1.0
         if self.conv_module is not None:
-            self.norm_conv = nn.LayerNorm(size,
-                                          eps=1e-5)  # for the CNN module
-            self.norm_final = nn.LayerNorm(
-                size, eps=1e-5)  # for the final output of the block
+            self.norm_conv = nn.LayerNorm(size, eps=1e-5)
+            self.norm_final = nn.LayerNorm(size, eps=1e-5)
         self.dropout = nn.Dropout(dropout_rate)
         self.size = size
         self.normalize_before = normalize_before
@@ -238,29 +223,22 @@ class ConformerEncoderLayer(nn.Module):
         att_cache: torch.Tensor = torch.zeros((0, 0, 0, 0)),
         cnn_cache: torch.Tensor = torch.zeros((0, 0, 0, 0)),
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute encoded features.
+        """
+        計算編碼特徵。
 
         Args:
             x (torch.Tensor): (#batch, time, size)
-            mask (torch.Tensor): Mask tensor for the input (#batch, time，time),
-                (0, 0, 0) means fake mask.
-            pos_emb (torch.Tensor): positional encoding, must not be None
-                for ConformerEncoderLayer.
-            mask_pad (torch.Tensor): batch padding mask used for conv module.
-                (#batch, 1，time), (0, 0, 0) means fake mask.
-            att_cache (torch.Tensor): Cache tensor of the KEY & VALUE
-                (#batch=1, head, cache_t1, d_k * 2), head * d_k == size.
-            cnn_cache (torch.Tensor): Convolution cache in conformer layer
-                (#batch=1, size, cache_t2)
+            mask (torch.Tensor): 輸入遮罩 (#batch, time, time)
+            pos_emb (torch.Tensor): 位置編碼
+            mask_pad (torch.Tensor): 批次填充遮罩 (#batch, 1, time)
+            att_cache (torch.Tensor): 注意力快取
+            cnn_cache (torch.Tensor): 卷積快取
+
         Returns:
-            torch.Tensor: Output tensor (#batch, time, size).
-            torch.Tensor: Mask tensor (#batch, time, time).
-            torch.Tensor: att_cache tensor,
-                (#batch=1, head, cache_t1 + time, d_k * 2).
-            torch.Tensor: cnn_cahce tensor (#batch, size, cache_t2).
+            Tuple[torch.Tensor, ...]: 輸出張量, 遮罩, 更新後的 att_cache, 更新後的 cnn_cache
         """
 
-        # whether to use macaron style
+        # Macaron 風格前饋
         if self.feed_forward_macaron is not None:
             residual = x
             if self.normalize_before:
@@ -270,7 +248,7 @@ class ConformerEncoderLayer(nn.Module):
             if not self.normalize_before:
                 x = self.norm_ff_macaron(x)
 
-        # multi-headed self-attention module
+        # 多頭自注意力模組
         residual = x
         if self.normalize_before:
             x = self.norm_mha(x)
@@ -285,8 +263,7 @@ class ConformerEncoderLayer(nn.Module):
         if not self.normalize_before:
             x = self.norm_mha(x)
 
-        # convolution module
-        # Fake new cnn cache here, and then change it in conv_module
+        # 卷積模組
         new_cnn_cache = torch.zeros((0, 0, 0), dtype=x.dtype, device=x.device)
         if self.conv_module is not None:
             residual = x
@@ -298,7 +275,7 @@ class ConformerEncoderLayer(nn.Module):
             if not self.normalize_before:
                 x = self.norm_conv(x)
 
-        # feed forward module
+        # 前饋模組
         residual = x
         if self.normalize_before:
             x = self.norm_ff(x)
@@ -328,36 +305,19 @@ class BaseEncoder(torch.nn.Module):
         concat_after: bool = False,
     ):
         """
+        編碼器基礎類別。
+
         Args:
-            input_size (int): input dim
-            output_size (int): dimension of attention
-            attention_heads (int): the number of heads of multi head attention
-            linear_units (int): the hidden units number of position-wise feed
-                forward
-            num_blocks (int): the number of decoder blocks
-            dropout_rate (float): dropout rate
-            attention_dropout_rate (float): dropout rate in attention
-            positional_dropout_rate (float): dropout rate after adding
-                positional encoding
-            input_layer (str): input layer type.
-                optional [linear, conv2d, conv2d6, conv2d8]
-            pos_enc_layer_type (str): Encoder positional encoding layer type.
-                opitonal [abs_pos, scaled_abs_pos, rel_pos, no_pos]
-            normalize_before (bool):
-                True: use layer_norm before each sub-block of a layer.
-                False: use layer_norm after each sub-block of a layer.
-            concat_after (bool): whether to concat attention layer's input
-                and output.
-                True: x -> x + linear(concat(x, att(x)))
-                False: x -> x + att(x)
-            static_chunk_size (int): chunk size for static chunk training and
-                decoding
-            use_dynamic_chunk (bool): whether use dynamic chunk size for
-                training or not, You can only use fixed chunk(chunk_size > 0)
-                or dyanmic chunk size(use_dynamic_chunk = True)
-            global_cmvn (Optional[torch.nn.Module]): Optional GlobalCMVN module
-            use_dynamic_left_chunk (bool): whether use dynamic left chunk in
-                dynamic chunk training
+            input_size (int): 輸入維度。
+            output_size (int): 注意力輸出維度。
+            attention_heads (int): 多頭注意力的頭數。
+            linear_units (int): 前饋層隱藏單元數。
+            num_blocks (int): 解碼器區塊數量。
+            dropout_rate (float): Dropout 比率。
+            input_layer (str): 輸入層類型。
+            pos_enc_layer_type (str): 位置編碼層類型。
+            normalize_before (bool): 是否在子區塊前進行 LayerNorm。
+            concat_after (bool): 是否串聯注意力層輸入與輸出。
         """
         super().__init__()
         self._output_size = output_size
@@ -369,7 +329,7 @@ class BaseEncoder(torch.nn.Module):
         elif pos_enc_layer_type == "no_pos":
             pos_enc_class = NoPositionalEncoding
         else:
-            raise ValueError("unknown pos_enc_layer: " + pos_enc_layer_type)
+            raise ValueError("未知的 pos_enc_layer: " + pos_enc_layer_type)
 
         if input_layer == "linear":
             subsampling_class = LinearNoSubsampling
@@ -382,7 +342,7 @@ class BaseEncoder(torch.nn.Module):
         elif input_layer == "conv2d8":
             subsampling_class = Conv2dSubsampling8
         else:
-            raise ValueError("unknown input_layer: " + input_layer)
+            raise ValueError("未知的 input_layer: " + input_layer)
 
         self.embed = subsampling_class(
             input_size,
@@ -402,42 +362,34 @@ class BaseEncoder(torch.nn.Module):
         xs: torch.Tensor,
         xs_lens: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Embed positions in tensor.
+        """
+        嵌入位置並進行前向傳播。
 
         Args:
-            xs: padded input tensor (B, T, D)
-            xs_lens: input length (B)
-            decoding_chunk_size: decoding chunk size for dynamic chunk
-                0: default for training, use random dynamic chunk.
-                <0: for decoding, use full chunk.
-                >0: for decoding, use fixed chunk size as set.
-            num_decoding_left_chunks: number of left chunks, this is for decoding,
-            the chunk size is decoding_chunk_size.
-                >=0: use num_decoding_left_chunks
-                <0: use all left chunks
+            xs: 填充後的輸入張量 (B, T, D)
+            xs_lens: 輸入長度 (B)
+
         Returns:
-            encoder output tensor xs, and subsampled masks
-            xs: padded output tensor (B, T' ~= T/subsample_rate, D)
-            masks: torch.Tensor batch padding mask after subsample
-                (B, 1, T' ~= T/subsample_rate)
+            xs: 輸出張量 (B, T', D)
+            masks: 填充遮罩 (B, 1, T')
         """
         T = xs.size(1)
         masks = ~make_pad_mask(xs_lens, T).unsqueeze(1)  # (B, 1, T)
         xs, pos_emb, masks = self.embed(xs, masks)
         chunk_masks = masks
-        mask_pad = masks  # (B, 1, T/subsample_rate)
+        mask_pad = masks
         for layer in self.encoders:
             xs, chunk_masks, _, _ = layer(xs, chunk_masks, pos_emb, mask_pad)
         if self.normalize_before:
             xs = self.after_norm(xs)
-        # Here we assume the mask is not changed in encoder layers, so just
-        # return the masks before encoder layers, and the masks will be used
-        # for cross attention with decoder later
+        
         return xs, masks
 
 
 class ConformerEncoder(BaseEncoder):
-    """Conformer encoder module."""
+    """
+    Conformer 編碼器模組。
+    """
 
     def __init__(
         self,
@@ -455,21 +407,13 @@ class ConformerEncoder(BaseEncoder):
         use_cnn_module: bool = True,
         cnn_module_kernel: int = 15,
     ):
-        """Construct ConformerEncoder
+        """
+        建構 ConformerEncoder。
 
         Args:
-            input_size to use_dynamic_chunk, see in BaseEncoder
-            positionwise_conv_kernel_size (int): Kernel size of positionwise
-                conv1d layer.
-            macaron_style (bool): Whether to use macaron style for
-                positionwise layer.
-            selfattention_layer_type (str): Encoder attention layer type,
-                the parameter has no effect now, it's just for configure
-                compatibility.
-            activation_type (str): Encoder activation function type.
-            use_cnn_module (bool): Whether to use convolution module.
-            cnn_module_kernel (int): Kernel size of convolution module.
-            causal (bool): whether to use causal convolution or not.
+            macaron_style (bool): 是否使用 Macaron 風格。
+            use_cnn_module (bool): 是否使用卷積模組。
+            cnn_module_kernel (int): 卷積模組的卷積核大小。
         """
 
         super().__init__(input_size, output_size, attention_heads,
@@ -479,7 +423,7 @@ class ConformerEncoder(BaseEncoder):
 
         activation = torch.nn.SiLU()
 
-        # self-attention module definition
+        # 定義自注意力模組
         if pos_enc_layer_type != "rel_pos":
             encoder_selfattn_layer = MultiHeadedAttention
         else:
@@ -490,7 +434,7 @@ class ConformerEncoder(BaseEncoder):
             dropout_rate,
         )
 
-        # feed-forward module definition
+        # 定義前饋模組
         positionwise_layer = PositionwiseFeedForward
         positionwise_layer_args = (
             output_size,
@@ -498,7 +442,8 @@ class ConformerEncoder(BaseEncoder):
             dropout_rate,
             activation,
         )
-        # convolution module definition
+        
+        # 定義卷積模組
         convolution_layer = ConvolutionModule
         convolution_layer_args = (output_size,
                                   cnn_module_kernel,

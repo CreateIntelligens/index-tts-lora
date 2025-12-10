@@ -27,6 +27,9 @@ def eval_decorator(fn):
 def dvae_wav_to_mel(
     wav, mel_norms_file="../experiments/clips_mel_norms.pth", mel_norms=None, device=torch.device("cpu")
 ):
+    """
+    將音訊波形轉換為 Mel 頻譜圖，用於 DVAE。
+    """
     mel_stft = torchaudio.transforms.MelSpectrogram(
         n_fft=1024,
         hop_length=256,
@@ -49,6 +52,9 @@ def dvae_wav_to_mel(
 
 
 class Quantize(nn.Module):
+    """
+    向量量化模組。
+    """
     def __init__(self, dim, n_embed, decay=0.99, eps=1e-5, balancing_heuristic=False, new_return_order=False):
         super().__init__()
 
@@ -79,7 +85,7 @@ class Quantize(nn.Module):
             self.embed_avg = (ea * ~mask + rand_embed).permute(1, 0)
             self.cluster_size = self.cluster_size * ~mask.squeeze()
             if torch.any(mask):
-                print(f"Reset {torch.sum(mask)} embedding codes.")
+                print(f"[資訊] 重置 {torch.sum(mask)} 個嵌入碼。")
                 self.codes = None
                 self.codes_full = False
 
@@ -129,10 +135,10 @@ class Quantize(nn.Module):
         return F.embedding(embed_id, self.embed.transpose(0, 1))
 
 
-# Fits a soft-discretized input to a normal-PDF across the specified dimension.
-# In other words, attempts to force the discretization function to have a mean equal utilization across all discrete
-# values with the specified expected variance.
 class DiscretizationLoss(nn.Module):
+    """
+    離散化損失函數。
+    """
     def __init__(self, discrete_bins, dim, expected_variance, store_past=0):
         super().__init__()
         self.discrete_bins = discrete_bins
@@ -157,7 +163,7 @@ class DiscretizationLoss(nn.Module):
             if self.accumulator_filled > 0:
                 averaged = torch.mean(self.accumulator, dim=0) * (acc_count - 1) / acc_count + averaged / acc_count
 
-            # Also push averaged into the accumulator.
+            # 將平均值推入累加器
             self.accumulator[self.accumulator_index] = avg
             self.accumulator_index += 1
             if self.accumulator_index >= acc_count:
@@ -196,9 +202,10 @@ class UpsampledConv(nn.Module):
         return self.conv(up)
 
 
-# DiscreteVAE partially derived from lucidrains DALLE implementation
-# Credit: https://github.com/lucidrains/DALLE-pytorch
 class DiscreteVAE(nn.Module):
+    """
+    離散變分自編碼器 (Discrete VAE)。
+    """
     def __init__(
         self,
         positional_dims=2,
@@ -215,7 +222,7 @@ class DiscreteVAE(nn.Module):
         activation="relu",
         smooth_l1_loss=False,
         straight_through=False,
-        normalization=None,  # ((0.5,) * 3, (0.5,) * 3),
+        normalization=None,
         record_codes=False,
         discretization_loss_averaging_steps=100,
         lr_quantizer_args={},
@@ -231,7 +238,7 @@ class DiscreteVAE(nn.Module):
             num_tokens, 2, 1 / (num_tokens * 2), discretization_loss_averaging_steps
         )
 
-        assert positional_dims > 0 and positional_dims < 3  # This VAE only supports 1d and 2d inputs for now.
+        assert positional_dims > 0 and positional_dims < 3
         if positional_dims == 2:
             conv = nn.Conv2d
             conv_transpose = nn.ConvTranspose2d
@@ -293,7 +300,6 @@ class DiscreteVAE(nn.Module):
         self.loss_fn = F.smooth_l1_loss if smooth_l1_loss else F.mse_loss
         self.codebook = Quantize(codebook_dim, num_tokens, new_return_order=True)
 
-        # take care of normalization within class
         self.normalization = normalization
         self.record_codes = record_codes
         if record_codes:
@@ -315,7 +321,6 @@ class DiscreteVAE(nn.Module):
 
     def get_debug_values(self, step, __):
         if self.record_codes and self.total_codes > 0:
-            # Report annealing schedule
             return {"histogram_codes": self.codes[: self.total_codes]}
         else:
             return {}
@@ -356,10 +361,10 @@ class DiscreteVAE(nn.Module):
         sampled, codes, commitment_loss = self.codebook(logits)
         return self.decode(codes)
 
-    # Note: This module is not meant to be run in forward() except while training. It has special logic which performs
-    # evaluation using quantized values when it detects that it is being run in eval() mode, which will be substantially
-    # more lossy (but useful for determining network performance).
     def forward(self, img):
+        """
+        前向傳播。
+        """
         img = self.norm(img)
         logits = self.encoder(img).permute((0, 2, 3, 1) if len(img.shape) == 4 else (0, 2, 1))
         sampled, codes, commitment_loss = self.codebook(logits)
@@ -371,10 +376,9 @@ class DiscreteVAE(nn.Module):
                 out = d(out)
             self.log_codes(codes)
         else:
-            # This is non-differentiable, but gives a better idea of how the network is actually performing.
             out, _ = self.decode(codes)
 
-        # reconstruction loss
+        # 重建損失
         out = out[..., :img.shape[-1]]
         recon_loss = self.loss_fn(img, out, reduction="mean")
         ssim_loss = torch.zeros(size=(1,)).cuda()
@@ -382,7 +386,6 @@ class DiscreteVAE(nn.Module):
         return recon_loss, ssim_loss, commitment_loss, out
 
     def log_codes(self, codes):
-        # This is so we can debug the distribution of codes being learned.
         if self.record_codes and self.internal_step % 10 == 0:
             codes = codes.flatten()
             l = codes.shape[0]

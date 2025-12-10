@@ -6,33 +6,33 @@ warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="IndexTTS Command Line")
-    parser.add_argument("text", type=str, help="Text to be synthesized")
-    parser.add_argument("-v", "--voice", type=str, required=True, help="Path to the audio prompt file (wav format)")
-    parser.add_argument("-o", "--output_path", type=str, default="gen.wav", help="Path to the output wav file")
-    parser.add_argument("-c", "--config", type=str, default="checkpoints/config.yaml", help="Path to the config file. Default is 'checkpoints/config.yaml'")
-    parser.add_argument("--model_dir", type=str, default="checkpoints", help="Path to the model directory. Default is 'checkpoints'")
-    parser.add_argument("--fp16", action="store_true", default=True, help="Use FP16 for inference if available")
-    parser.add_argument("-f", "--force", action="store_true", default=False, help="Force to overwrite the output file if it exists")
-    parser.add_argument("-d", "--device", type=str, default=None, help="Device to run the model on (cpu, cuda, mps)." )
+    parser = argparse.ArgumentParser(description="IndexTTS 命令列工具")
+    parser.add_argument("text", type=str, help="要合成的文字")
+    parser.add_argument("-v", "--voice", type=str, required=True, help="參考音訊檔案路徑 (wav 格式)")
+    parser.add_argument("-o", "--output_path", type=str, default="gen.wav", help="輸出音訊檔案路徑")
+    parser.add_argument("-c", "--config", type=str, default="checkpoints/config.yaml", help="設定檔路徑。預設為 'checkpoints/config.yaml'")
+    parser.add_argument("--model_dir", type=str, default="checkpoints", help="模型目錄路徑。預設為 'checkpoints'")
+    parser.add_argument("--fp16", action="store_true", default=True, help="若可用則使用 FP16 推理")
+    parser.add_argument("-f", "--force", action="store_true", default=False, help="強制覆蓋已存在的輸出檔案")
+    parser.add_argument("-d", "--device", type=str, default=None, help="執行模型的裝置 (cpu, cuda, mps)。" )
     args = parser.parse_args()
     if len(args.text.strip()) == 0:
-        print("ERROR: Text is empty.")
+        print("[錯誤] 文字內容為空。")
         parser.print_help()
         sys.exit(1)
     if not os.path.exists(args.voice):
-        print(f"Audio prompt file {args.voice} does not exist.")
+        print(f"[錯誤] 參考音訊檔案 {args.voice} 不存在。")
         parser.print_help()
         sys.exit(1)
     if not os.path.exists(args.config):
-        print(f"Config file {args.config} does not exist.")
+        print(f"[錯誤] 設定檔 {args.config} 不存在。")
         parser.print_help()
         sys.exit(1)
 
     output_path = args.output_path
     if os.path.exists(output_path):
         if not args.force:
-            print(f"ERROR: Output file {output_path} already exists. Use --force to overwrite.")
+            print(f"[錯誤] 輸出檔案 {output_path} 已存在。請使用 --force 強制覆蓋。")
             parser.print_help()
             sys.exit(1)
         else:
@@ -41,7 +41,7 @@ def main():
     try:
         import torch
     except ImportError:
-        print("ERROR: PyTorch is not installed. Please install it first.")
+        print("[錯誤] 未安裝 PyTorch。請先安裝。")
         sys.exit(1)
 
     if args.device is None:
@@ -52,7 +52,7 @@ def main():
         else:
             args.device = "cpu"
             args.fp16 = False # Disable FP16 on CPU
-            print("WARNING: Running on CPU may be slow.")
+            print("[警告] 使用 CPU 運行可能較慢。")
 
     from indextts.infer import IndexTTS
     tts = IndexTTS(cfg_path=args.config, model_dir=args.model_dir, is_fp16=args.fp16, device=args.device)

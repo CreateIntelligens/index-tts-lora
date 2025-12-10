@@ -9,6 +9,11 @@ from sentencepiece import SentencePieceProcessor
 
 
 class TextNormalizer:
+    """
+    文字正規化處理器。
+    
+    負責處理中文與英文的文字正規化，包括標點符號替換、拼音轉換、人名處理等。
+    """
     def __init__(self):
         self.zh_normalizer = None
         self.en_normalizer = None
@@ -55,23 +60,23 @@ class TextNormalizer:
         }
 
     def match_email(self, email):
-        # 正則表示式匹配郵箱格式：數字英文@數字英文.英文
+        # 正則表示式匹配電子信箱格式
         pattern = r"^[a-zA-Z0-9]+@[a-zA-Z0-9]+\.[a-zA-Z]+$"
         return re.match(pattern, email) is not None
 
     PINYIN_TONE_PATTERN = r"(?<![a-z])((?:[bpmfdtnlgkhjqxzcsryw]|[zcs]h)?(?:[aeiouüv]|[ae]i|u[aio]|ao|ou|i[aue]|[uüv]e|[uvü]ang?|uai|[aeiuv]n|[aeio]ng|ia[no]|i[ao]ng)|ng|er)([1-5])"
     """
-    匹配拼音聲調格式：pinyin+數字，聲調1-5，5表示輕聲
-    例如：xuan4, jve2, ying1, zhong4, shang5
-    不匹配：beta1, voice2
+    匹配拼音聲調格式：拼音+數字，聲調範圍 1-5 (5 為輕聲)。
+    範例: xuan4, jve2, ying1, zhong4, shang5
+    排除: beta1, voice2
     """
     NAME_PATTERN = r"[\u4e00-\u9fff]+(?:[-·—][\u4e00-\u9fff]+){1,2}"
     """
-    匹配人名，格式：中文·中文，中文·中文-中文
-    例如：克里斯托弗·諾蘭，約瑟夫·高登-萊維特
+    匹配人名格式：中文·中文 或 中文·中文-中文。
+    範例: 克里斯托弗·諾蘭，約瑟夫·高登-萊維特
     """
 
-    # 匹配常見英語縮寫 's，僅用於替換為 is，不匹配所有 's
+    # 匹配常見英語縮寫 's，僅用於替換為 is
     ENGLISH_CONTRACTION_PATTERN = r"(what|where|who|which|how|t?here|it|s?he|that|this)'s"
 
 
@@ -86,8 +91,6 @@ class TextNormalizer:
         return has_pinyin
 
     def load(self):
-        # print(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-        # sys.path.append(model_dir)
         import platform
         if self.zh_normalizer is not None and self.en_normalizer is not None:
             return
@@ -99,7 +102,8 @@ class TextNormalizer:
         else:
             from tn.chinese.normalizer import Normalizer as NormalizerZh
             from tn.english.normalizer import Normalizer as NormalizerEn
-            # use new cache dir for build tagger rules with disable remove_interjections and remove_erhua
+            
+            # 使用快取目錄以避免重複建構規則
             cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tagger_cache")
             if not os.path.exists(cache_dir):
                 os.makedirs(cache_dir)
@@ -112,7 +116,7 @@ class TextNormalizer:
 
     def normalize(self, text: str) -> str:
         if not self.zh_normalizer or not self.en_normalizer:
-            print("Error, text normalizer is not initialized !!!")
+            print("[錯誤] TextNormalizer 尚未初始化！")
             return ""
         if self.use_chinese(text):
             text = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
@@ -143,12 +147,11 @@ class TextNormalizer:
 
     def correct_pinyin(self, pinyin: str):
         """
-        將 jqx 的韻母為 u/ü 的拼音轉換為 v
-        如：ju -> jv , que -> qve, xün -> xvn
+        修正 jqx 韻母為 u/ü 的拼音，轉換為 v。
+        範例：ju -> jv , que -> qve, xün -> xvn
         """
         if pinyin[0] not in "jqxJQX":
             return pinyin
-        # 匹配 jqx 的韻母為 u/ü 的拼音
         pattern = r"([jqx])[uü](n|e|an)*(\d)"
         repl = r"\g<1>v\g<2>\g<3>"
         pinyin = re.sub(pattern, repl, pinyin, flags=re.IGNORECASE)
@@ -156,8 +159,7 @@ class TextNormalizer:
 
     def save_names(self, original_text):
         """
-        替換人名為佔位符 <n_a>、 <n_b>, ...
-        例如：克里斯托弗·諾蘭 -> <n_a>
+        將人名替換為佔位符 <n_a>、 <n_b> 等。
         """
         # 人名
         name_pattern = re.compile(TextNormalizer.NAME_PATTERN, re.IGNORECASE)
@@ -166,7 +168,6 @@ class TextNormalizer:
             return (original_text, None)
         original_name_list = list(set("".join(n) for n in original_name_list))
         transformed_text = original_text
-        # 替換佔位符 <n_a>、 <n_b>, ...
         for i, name in enumerate(original_name_list):
             number = chr(ord("a") + i)
             transformed_text = transformed_text.replace(name, f"<n_{number}>")
@@ -175,14 +176,12 @@ class TextNormalizer:
 
     def restore_names(self, normalized_text, original_name_list):
         """
-        恢復人名為原來的文字
-        例如：<n_a> -> original_name_list[0]
+        將人名佔位符恢復為原始文字。
         """
         if not original_name_list or len(original_name_list) == 0:
             return normalized_text
 
         transformed_text = normalized_text
-        # 替換為佔位符 <n_a>、 <n_b>, ...
         for i, name in enumerate(original_name_list):
             number = chr(ord("a") + i)
             transformed_text = transformed_text.replace(f"<n_{number}>", name)
@@ -190,60 +189,57 @@ class TextNormalizer:
 
     def save_pinyin_tones(self, original_text):
         """
-        替換拼音聲調為佔位符 <pinyin_a>, <pinyin_b>, ...
-        例如：xuan4 -> <pinyin_a>
+        將拼音聲調替換為佔位符 <pinyin_a>, <pinyin_b> 等。
         """
-        # 聲母韻母+聲調數字
         origin_pinyin_pattern = re.compile(TextNormalizer.PINYIN_TONE_PATTERN, re.IGNORECASE)
         original_pinyin_list = re.findall(origin_pinyin_pattern, original_text)
         if len(original_pinyin_list) == 0:
             return (original_text, None)
         original_pinyin_list = list(set("".join(p) for p in original_pinyin_list))
         transformed_text = original_text
-        # 替換為佔位符 <pinyin_a>, <pinyin_b>, ...
         for i, pinyin in enumerate(original_pinyin_list):
             number = chr(ord("a") + i)
             transformed_text = transformed_text.replace(pinyin, f"<pinyin_{number}>")
 
-        # print("original_text: ", original_text)
-        # print("transformed_text: ", transformed_text)
         return transformed_text, original_pinyin_list
 
     def restore_pinyin_tones(self, normalized_text, original_pinyin_list):
         """
-        恢復拼音中的音調數字（1-5）為原來的拼音
-        例如：<pinyin_a> -> original_pinyin_list[0]
+        將拼音佔位符恢復為原始拼音。
         """
         if not original_pinyin_list or len(original_pinyin_list) == 0:
             return normalized_text
 
         transformed_text = normalized_text
-        # 替換佔位符 <pinyin_a>, <pinyin_b>, ...
         for i, pinyin in enumerate(original_pinyin_list):
             number = chr(ord("a") + i)
             pinyin = self.correct_pinyin(pinyin)
             transformed_text = transformed_text.replace(f"<pinyin_{number}>", pinyin)
-        # print("normalized_text: ", normalized_text)
-        # print("transformed_text: ", transformed_text)
         return transformed_text
 
 
 class TextTokenizer:
+    """
+    文字分詞器 (Tokenizer)。
+    
+    使用 SentencePiece 模型進行分詞，支援 BPE 等演算法。
+    """
     def __init__(self, vocab_file: str, normalizer: TextNormalizer = None):
         self.vocab_file = vocab_file
         self.normalizer = normalizer
 
         if self.vocab_file is None:
-            raise ValueError("vocab_file is None")
+            raise ValueError("vocab_file 未指定")
         if not os.path.exists(self.vocab_file):
-            raise ValueError(f"vocab_file {self.vocab_file} does not exist")
+            raise ValueError(f"詞表檔案 {self.vocab_file} 不存在")
         if self.normalizer:
             self.normalizer.load()
-        # 載入詞表
+        
+        # 載入 SentencePiece 模型
         self.sp_model = SentencePieceProcessor(model_file=self.vocab_file)
 
         self.pre_tokenizers = [
-            # 預處理器
+            # 預處理器: 依 CJK 字元切分
             tokenize_by_CJK_char,
         ]
 
@@ -346,9 +342,8 @@ class TextTokenizer:
         tokenized_str: List[str], split_tokens: List[str], max_tokens_per_sentence: int
     ) -> List[List[str]]:
         """
-        將tokenize後的結果按特定token進一步分割
+        將 Tokenize 後的序列按特定 Token 進行分割，以適應模型輸入長度限制。
         """
-        # 處理特殊情況
         if len(tokenized_str) == 0:
             return []
         sentences: List[List[str]] = []
@@ -362,26 +357,27 @@ class TextTokenizer:
                 if token in split_tokens and current_sentence_tokens_len > 2:
                     if i < len(tokenized_str) - 1:
                         if tokenized_str[i + 1] in ["'", "▁'"]:
-                            # 後續token是'，則不切分
+                            # 後續 Token 是 '，則不切分
                             current_sentence.append(tokenized_str[i + 1])
                             i += 1
                     sentences.append(current_sentence)
                     current_sentence = []
                     current_sentence_tokens_len = 0
                 continue
-            # 如果當前tokens的長度超過最大限制
+            
+            # 長度超過限制，嘗試強制分割
             if not  ("," in split_tokens or "▁," in split_tokens ) and ("," in current_sentence or "▁," in current_sentence): 
-                # 如果當前tokens中有,，則按,分割
+                # 優先按逗號分割
                 sub_sentences = TextTokenizer.split_sentences_by_token(
                     current_sentence, [",", "▁,"], max_tokens_per_sentence=max_tokens_per_sentence
                 )
             elif "-" not in split_tokens and "-" in current_sentence:
-                # 沒有,，則按-分割
+                # 其次按連字號分割
                 sub_sentences = TextTokenizer.split_sentences_by_token(
                     current_sentence, ["-"], max_tokens_per_sentence=max_tokens_per_sentence
                 )
             else:
-                # 按照長度分割
+                # 最後按長度硬切
                 sub_sentences = []
                 for j in range(0, len(current_sentence), max_tokens_per_sentence):
                     if j + max_tokens_per_sentence < len(current_sentence):
@@ -389,18 +385,19 @@ class TextTokenizer:
                     else:
                         sub_sentences.append(current_sentence[j:])
                 warnings.warn(
-                    f"The tokens length of sentence exceeds limit: {max_tokens_per_sentence}, "
-                    f"Tokens in sentence: {current_sentence}."
-                    "Maybe unexpected behavior",
+                    f"警告: 句子 Token 長度超過限制 ({max_tokens_per_sentence})，已執行強制切分。"
+                    f"句子內容: {current_sentence}",
                     RuntimeWarning,
                 )
             sentences.extend(sub_sentences)
             current_sentence = []
             current_sentence_tokens_len = 0
+        
         if current_sentence_tokens_len > 0:
             assert current_sentence_tokens_len <= max_tokens_per_sentence
             sentences.append(current_sentence)
-        # 如果相鄰的句子加起來長度小於最大限制，則合併
+            
+        # 合併過短的相鄰句子
         merged_sentences = []
         for sentence in sentences:
             if len(sentence) == 0:
@@ -418,9 +415,8 @@ class TextTokenizer:
         "!",
         "?",
         "▁.",
-        # "▁!", # unk
         "▁?",
-        "▁...", # ellipsis
+        "▁...", 
     ]
     def split_sentences(self, tokenized: List[str], max_tokens_per_sentence=120) -> List[List[str]]:
         return TextTokenizer.split_sentences_by_token(
@@ -491,46 +487,40 @@ if __name__ == "__main__":
         out_type=int,
     )
 
-    print(f"vocab_size: {tokenizer.vocab_size}")
-    # print(f"pad_token: {tokenizer.pad_token}, pad_token_id: {tokenizer.pad_token_id}")
-    print(f"bos_token: {tokenizer.bos_token}, bos_token_id: {tokenizer.bos_token_id}")
-    print(f"eos_token: {tokenizer.eos_token}, eos_token_id: {tokenizer.eos_token_id}")
-    print(f"unk_token: {tokenizer.unk_token}, unk_token_id: {tokenizer.unk_token_id}")
+    print(f"Vocab Size: {tokenizer.vocab_size}")
+    print(f"Special Tokens: BOS={tokenizer.bos_token}({tokenizer.bos_token_id}), EOS={tokenizer.eos_token}({tokenizer.eos_token_id})")
+    
     # 測試拼音 (8474-10201)
     for id in range(8474, 10201):
         pinyin = tokenizer.convert_ids_to_tokens(id)
         if re.match(TextNormalizer.PINYIN_TONE_PATTERN, pinyin, re.IGNORECASE) is None:
-            print(f"{pinyin} should be matched")
-    for badcase in [
-        "beta1", "better1", "voice2", "bala2", "babala2", "hunger2"
-    ]:
+            print(f"[錯誤] 拼音未匹配: {pinyin}")
+            
+    for badcase in ["beta1", "better1", "voice2", "bala2", "babala2", "hunger2"]:
         if re.match(TextNormalizer.PINYIN_TONE_PATTERN, badcase, re.IGNORECASE) is not None:
-            print(f"{badcase} should not be matched!")
+            print(f"[錯誤] 非拼音卻被匹配: {badcase}")
+            
     # 不應該有 unk_token_id
     for t in set([*TextTokenizer.punctuation_marks_tokens, ",", "▁,", "-", "▁..."]):
         tokens = tokenizer.convert_tokens_to_ids(t)
         if tokenizer.unk_token_id in tokens:
-            print(f"Warning: {t} is unknown token")
-        print(f"`{t}`", "->", tokens, "->", tokenizer.convert_ids_to_tokens(tokens))
-    for ch in set(tokenizer.normalizer.zh_char_rep_map.values()):
-        # 測試 normalize後的字元能被分詞器識別
-        print(f"`{ch}`", "->", tokenizer.sp_model.Encode(ch, out_type=str))
-        print(f"` {ch}`", "->", tokenizer.sp_model.Encode(f" {ch}", out_type=str))
+            print(f"[警告] 發現未知 Token: {t}")
+        # print(f"`{t}`", "->", tokens, "->", tokenizer.convert_ids_to_tokens(tokens))
+        
     max_tokens_per_sentence=120
     for i in range(len(cases)):
         print(f"原始文字: {cases[i]}")
-        print(f"Normalized: {text_normalizer.normalize(cases[i])}")
+        print(f"正規化後: {text_normalizer.normalize(cases[i])}")
         tokens = tokenizer.tokenize(cases[i])
-        print("Tokenzied: ", ", ".join([f"`{t}`" for t in tokens]))
+        print("分詞結果: ", ", ".join([f"`{t}`" for t in tokens]))
         sentences = tokenizer.split_sentences(tokens, max_tokens_per_sentence=max_tokens_per_sentence)
-        print("Splitted sentences count:", len(sentences))
+        print(f"分句數量: {len(sentences)}")
         if len(sentences) > 1:
             for j in range(len(sentences)):
-                print(f"  {j}, count:", len(sentences[j]), ", tokens:", "".join(sentences[j]))
+                print(f"  {j}, 詞數: {len(sentences[j])}, 內容: {''.join(sentences[j])}")
                 if len(sentences[j]) > max_tokens_per_sentence:
-                    print(f"Warning: sentence {j} is too long, length: {len(sentences[j])}")
-        #print(f"Token IDs (first 10): {codes[i][:10]}")
+                    print(f"  [警告] 句子 {j} 超過長度限制 ({len(sentences[j])})")
         if tokenizer.unk_token in codes[i]:
-            print(f"Warning: `{cases[i]}` contains UNKNOWN token")
-        print(f"Decoded: {tokenizer.decode(codes[i], do_lower_case=True)}")
+            print(f"[警告] 輸入包含未知 Token")
+        print(f"解碼測試: {tokenizer.decode(codes[i], do_lower_case=True)}")
         print("-" * 50)

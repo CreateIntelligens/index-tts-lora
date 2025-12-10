@@ -60,7 +60,7 @@ class AMPBlock1(torch.nn.Module):
                 for _ in range(self.num_layers)
             ])
         else:
-            raise NotImplementedError("activation incorrectly specified. check the config file and look for 'activation'.")
+            raise NotImplementedError("激活函數指定錯誤。請檢查配置檔中的 'activation' 欄位。")
 
     def forward(self, x):
         acts1, acts2 = self.activations[::2], self.activations[1::2]
@@ -112,7 +112,7 @@ class AMPBlock2(torch.nn.Module):
                 for _ in range(self.num_layers)
             ])
         else:
-            raise NotImplementedError("activation incorrectly specified. check the config file and look for 'activation'.")
+            raise NotImplementedError("激活函數指定錯誤。請檢查配置檔中的 'activation' 欄位。")
 
     def forward(self, x):
         for c, a in zip(self.convs, self.activations):
@@ -131,9 +131,11 @@ class BigVGAN(torch.nn.Module):
     # this is our main BigVGAN model. Applies anti-aliased periodic activation for resblocks.
     def __init__(self, h, use_cuda_kernel=False):
         """
+        BigVGAN 聲碼器模型。
+
         Args:
-            h (dict)
-            use_cuda_kernel (bool): whether to use custom cuda kernel for anti-aliased activation
+            h (dict): 超參數字典。
+            use_cuda_kernel (bool): 是否使用 CUDA kernel。
         """
         super(BigVGAN, self).__init__()
         self.h = h
@@ -179,7 +181,7 @@ class BigVGAN(torch.nn.Module):
             activation_post = activations.SnakeBeta(ch, alpha_logscale=h.snake_logscale)
             self.activation_post = Activation1d(activation=activation_post)
         else:
-            raise NotImplementedError("activation incorrectly specified. check the config file and look for 'activation'.")
+            raise NotImplementedError("激活函數指定錯誤。請檢查配置檔中的 'activation' 欄位。")
 
         self.conv_post = weight_norm(Conv1d(ch, 1, 7, 1, padding=3))
 
@@ -250,7 +252,7 @@ class BigVGAN(torch.nn.Module):
         return x, contrastive_loss
 
     def remove_weight_norm(self):
-        print('Removing weight norm...')
+        print('[資訊] 正在移除 Weight Norm...')
         for l in self.ups:
             for l_i in l:
                 remove_weight_norm(l_i)
@@ -316,7 +318,7 @@ class MultiPeriodDiscriminator(torch.nn.Module):
     def __init__(self, h):
         super(MultiPeriodDiscriminator, self).__init__()
         self.mpd_reshapes = h.mpd_reshapes
-        print("mpd_reshapes: {}".format(self.mpd_reshapes))
+        print("[資訊] mpd_reshapes: {}".format(self.mpd_reshapes))
         discriminators = [DiscriminatorP(h, rs, use_spectral_norm=h.use_spectral_norm) for rs in self.mpd_reshapes]
         self.discriminators = nn.ModuleList(discriminators)
 
@@ -342,16 +344,16 @@ class DiscriminatorR(nn.Module):
 
         self.resolution = resolution
         assert len(self.resolution) == 3, \
-            "MRD layer requires list with len=3, got {}".format(self.resolution)
+            "MRD 層需要長度為 3 的列表，但得到 {}".format(self.resolution)
         self.lrelu_slope = LRELU_SLOPE
 
         norm_f = weight_norm if cfg.use_spectral_norm == False else spectral_norm
         if hasattr(cfg, "mrd_use_spectral_norm"):
-            print("INFO: overriding MRD use_spectral_norm as {}".format(cfg.mrd_use_spectral_norm))
+            print("[資訊] 覆蓋 MRD use_spectral_norm 為 {}".format(cfg.mrd_use_spectral_norm))
             norm_f = weight_norm if cfg.mrd_use_spectral_norm == False else spectral_norm
         self.d_mult = cfg.discriminator_channel_mult
         if hasattr(cfg, "mrd_channel_mult"):
-            print("INFO: overriding mrd channel multiplier as {}".format(cfg.mrd_channel_mult))
+            print("[資訊] 覆蓋 mrd channel multiplier 為 {}".format(cfg.mrd_channel_mult))
             self.d_mult = cfg.mrd_channel_mult
 
         self.convs = nn.ModuleList([
@@ -394,7 +396,7 @@ class MultiResolutionDiscriminator(nn.Module):
         super().__init__()
         self.resolutions = cfg.resolutions
         assert len(self.resolutions) == 3, \
-            "MRD requires list of list with len=3, each element having a list with len=3. got {}".\
+            "MRD 需要包含 3 個解析度配置的列表。得到 {}".\
             format(self.resolutions)
         self.discriminators = nn.ModuleList(
             [DiscriminatorR(cfg, resolution) for resolution in self.resolutions]

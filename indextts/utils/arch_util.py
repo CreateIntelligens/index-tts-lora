@@ -8,7 +8,7 @@ from indextts.utils.xtransformers import RelativePositionBias
 
 def zero_module(module):
     """
-    Zero out the parameters of a module and return it.
+    將模組參數初始化為零並返回。
     """
     for p in module.parameters():
         p.detach().zero_()
@@ -22,10 +22,13 @@ class GroupNorm32(nn.GroupNorm):
 
 def normalization(channels):
     """
-    Make a standard normalization layer.
+    建立標準化層 (Normalization Layer)。
 
-    :param channels: number of input channels.
-    :return: an nn.Module for normalization.
+    Args:
+        channels (int): 輸入通道數。
+
+    Returns:
+        nn.Module: 標準化模組。
     """
     groups = 32
     if channels <= 16:
@@ -40,7 +43,9 @@ def normalization(channels):
 
 class QKVAttentionLegacy(nn.Module):
     """
-    A module which performs QKV attention. Matches legacy QKVAttention + input/output heads shaping
+    執行 QKV 注意力機制的模組。
+    
+    與舊版 QKVAttention 的輸入/輸出頭部形狀相容。
     """
 
     def __init__(self, n_heads):
@@ -49,10 +54,13 @@ class QKVAttentionLegacy(nn.Module):
 
     def forward(self, qkv, mask=None, rel_pos=None):
         """
-        Apply QKV attention.
+        應用 QKV 注意力。
 
-        :param qkv: an [N x (H * 3 * C) x T] tensor of Qs, Ks, and Vs.
-        :return: an [N x (H * C) x T] tensor after attention.
+        Args:
+            qkv: Q, K, V 的張量，形狀為 [N x (H * 3 * C) x T]。
+
+        Returns:
+            注意力運算後的張量，形狀為 [N x (H * C) x T]。
         """
         bs, width, length = qkv.shape
         assert width % (3 * self.n_heads) == 0
@@ -61,12 +69,11 @@ class QKVAttentionLegacy(nn.Module):
         scale = 1 / math.sqrt(math.sqrt(ch))
         weight = torch.einsum(
             "bct,bcs->bts", q * scale, k * scale
-        )  # More stable with f16 than dividing afterwards
+        )  # 在 FP16 下比事後除法更穩定
         if rel_pos is not None:
             weight = rel_pos(weight.reshape(bs, self.n_heads, weight.shape[-2], weight.shape[-1])).reshape(bs * self.n_heads, weight.shape[-2], weight.shape[-1])
         weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
         if mask is not None:
-            # The proper way to do this is to mask before the softmax using -inf, but that doesn't work properly on CPUs.
             mask = mask.repeat(self.n_heads, 1).unsqueeze(1)
             weight = weight * mask
         a = torch.einsum("bts,bcs->bct", weight, v)
@@ -76,10 +83,9 @@ class QKVAttentionLegacy(nn.Module):
 
 class AttentionBlock(nn.Module):
     """
-    An attention block that allows spatial positions to attend to each other.
+    允許空間位置相互關注的注意力區塊。
 
-    Originally ported from here, but adapted to the N-d case.
-    https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0706c543/diffusion_tf/models/unet.py#L66.
+    改編自: https://github.com/hojonathanho/diffusion
     """
 
     def __init__(
@@ -98,11 +104,11 @@ class AttentionBlock(nn.Module):
         else:
             assert (
                 channels % num_head_channels == 0
-            ), f"q,k,v channels {channels} is not divisible by num_head_channels {num_head_channels}"
+            ), f"通道數 {channels} 無法被 num_head_channels {num_head_channels} 整除"
             self.num_heads = channels // num_head_channels
         self.norm = normalization(channels)
         self.qkv = nn.Conv1d(channels, channels * 3, 1)
-        # split heads before split qkv
+        # 先分頭再分 QKV
         self.attention = QKVAttentionLegacy(self.num_heads)
 
         self.proj_out = zero_module(nn.Conv1d(channels, channels, 1))

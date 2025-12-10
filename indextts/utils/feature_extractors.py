@@ -5,28 +5,46 @@ from indextts.utils.common import safe_log
 
 
 class FeatureExtractor(nn.Module):
-    """Base class for feature extractors."""
+    """
+    特徵提取器基礎類別 (Base class for feature extractors)。
+    """
 
     def forward(self, audio: torch.Tensor, **kwargs) -> torch.Tensor:
         """
-        Extract features from the given audio.
+        從輸入音訊中提取特徵。
 
         Args:
-            audio (Tensor): Input audio waveform.
+            audio (Tensor): 輸入音訊波形。
 
         Returns:
-            Tensor: Extracted features of shape (B, C, L), where B is the batch size,
-                    C denotes output features, and L is the sequence length.
+            Tensor: 提取的特徵張量，形狀為 (B, C, L)，
+                    其中 B 為批次大小，C 為輸出特徵數，L 為序列長度。
         """
-        raise NotImplementedError("Subclasses must implement the forward method.")
+        raise NotImplementedError("子類別必須實作 forward 方法。")
 
 
 class MelSpectrogramFeatures(FeatureExtractor):
+    """
+    Mel 頻譜圖特徵提取器。
+
+    使用 torchaudio.transforms.MelSpectrogram 進行提取，並應用對數轉換。
+
+    Args:
+        sample_rate (int): 取樣率。
+        n_fft (int): FFT 視窗大小。
+        hop_length (int): 幀移 (Hop length)。
+        win_length (int): 視窗長度。
+        n_mels (int): Mel 濾波器組數量。
+        mel_fmin (float): Mel 頻率下限。
+        mel_fmax (float): Mel 頻率上限。
+        normalize (bool): 是否標準化。
+        padding (str): 填充模式 ('center' 或 'same')。
+    """
     def __init__(self, sample_rate=24000, n_fft=1024, hop_length=256, win_length=None,
                  n_mels=100, mel_fmin=0, mel_fmax=None, normalize=False, padding="center"):
         super().__init__()
         if padding not in ["center", "same"]:
-            raise ValueError("Padding must be 'center' or 'same'.")
+            raise ValueError("Padding 模式必須為 'center' 或 'same'。")
         self.padding = padding
         self.mel_spec = torchaudio.transforms.MelSpectrogram(
             sample_rate=sample_rate,

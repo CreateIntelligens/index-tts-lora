@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="zh-TW" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IndexTTS Studio</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Vue 3 -->
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <!-- Wavesurfer.js -->
+    <script src="https://unpkg.com/wavesurfer.js@7"></script>
+    <!-- Phosphor Icons -->
+    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+    
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        primary: '#6366f1', // Indigo 500
+                        secondary: '#4f46e5', // Indigo 600
+                        dark: '#0f172a', // Slate 900
+                        surface: '#1e293b', // Slate 800
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body { font-family: 'Inter', system-ui, -apple-system, sans-serif; }
+        .slider-thumb::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: #6366f1;
+            cursor: pointer;
+        }
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 6px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: #1e293b; 
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: #475569; 
+            border-radius: 3px;
+        }
+    </style>
+</head>
+<body class="bg-dark text-slate-200 h-screen overflow-hidden flex flex-col">
+
+    <div id="app" class="flex flex-1 h-full">
+        <!-- Sidebar: 設定區 -->
+        <aside class="w-80 bg-surface border-r border-slate-700 flex flex-col h-full custom-scrollbar overflow-y-auto">
+            <div class="p-6 border-b border-slate-700">
+                <h1 class="text-2xl font-bold text-white flex items-center gap-2">
+                    <i class="ph ph-wave-sine text-primary"></i> IndexTTS
+                </h1>
+                <p class="text-xs text-slate-400 mt-1">工業級語音合成工作台</p>
+            </div>
+
+            <div class="p-6 space-y-8 flex-1">
+                <!-- 模型選擇 -->
+                <div>
+                    <label class="text-sm font-semibold text-slate-300 mb-2 block flex items-center gap-2">
+                        <i class="ph ph-cpu"></i> 模型選擇
+                    </label>
+                    <select v-model="selectedModel" @change="changeModel" class="w-full bg-dark border border-slate-600 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-primary transition-colors">
+                        <option v-for="m in models" :value="m.filename">{{ m.name }}</option>
+                    </select>
+                    <p class="text-xs text-slate-500 mt-2" v-if="loadingModel">
+                        <i class="ph ph-spinner animate-spin"></i> 正在載入模型...
+                    </p>
+                </div>
+
+                <!-- 參考音訊 -->
+                <div>
+                    <label class="text-sm font-semibold text-slate-300 mb-2 block flex items-center gap-2">
+                        <i class="ph ph-microphone"></i> 參考音訊 (Prompt)
+                    </label>
+                    
+                    <!-- 檔案上傳區 -->
+                    <div 
+                        class="border-2 border-dashed border-slate-600 rounded-lg p-4 text-center cursor-pointer hover:border-primary transition-colors relative"
+                        @click="$refs.fileInput.click()"
+                        @dragover.prevent
+                        @drop.prevent="handleDrop"
+                    >
+                        <input type="file" ref="fileInput" @change="handleFileSelect" class="hidden" accept="audio/*">
+                        <div v-if="!promptFile" class="text-slate-400">
+                            <i class="ph ph-upload-simple text-2xl mb-1"></i>
+                            <p class="text-xs">點擊或拖放音訊檔案</p>
+                        </div>
+                        <div v-else class="text-primary flex items-center justify-center gap-2">
+                            <i class="ph ph-file-audio text-xl"></i>
+                            <span class="text-sm truncate max-w-[150px]">{{ promptFile.name }}</span>
+                            <button @click.stop="promptFile = null" class="text-slate-400 hover:text-red-400">
+                                <i class="ph ph-x"></i>
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <!-- 預設範例 -->
+                    <div class="mt-3">
+                        <p class="text-xs text-slate-500 mb-1">或使用伺服器範例:</p>
+                        <select v-model="serverPromptPath" class="w-full bg-dark border border-slate-600 rounded-lg px-2 py-1 text-xs text-slate-400">
+                            <option value="">-- 使用上傳檔案 --</option>
+                            <option value="tests/sample_prompt.wav">tests/sample_prompt.wav</option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- 生成參數 -->
+                <div class="space-y-4">
+                    <div class="flex items-center justify-between">
+                        <label class="text-sm font-semibold text-slate-300">推理模式</label>
+                        <div class="flex bg-dark rounded p-1">
+                            <button @click="params.infer_mode = 'normal'" :class="{'bg-primary text-white': params.infer_mode === 'normal', 'text-slate-400': params.infer_mode !== 'normal'}" class="px-3 py-1 rounded text-xs transition-colors">普通</button>
+                            <button @click="params.infer_mode = 'fast'" :class="{'bg-primary text-white': params.infer_mode === 'fast', 'text-slate-400': params.infer_mode !== 'fast'}" class="px-3 py-1 rounded text-xs transition-colors">快速</button>
+                        </div>
+                    </div>
+
+                    <!-- 參數滑桿組 -->
+                    <div v-for="(val, key) in sliders" :key="key">
+                        <div class="flex justify-between mb-1">
+                            <label class="text-xs text-slate-400">{{ val.label }}</label>
+                            <span class="text-xs text-primary font-mono">{{ params[key] }}</span>
+                        </div>
+                        <input type="range" v-model.number="params[key]" :min="val.min" :max="val.max" :step="val.step" class="w-full h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer slider-thumb">
+                    </div>
+                    
+                    <div class="flex items-center justify-between">
+                        <label class="text-xs text-slate-400">Do Sample</label>
+                        <input type="checkbox" v-model="params.do_sample" class="w-4 h-4 rounded border-slate-600 text-primary focus:ring-0">
+                    </div>
+                </div>
+            </div>
+            
+            <div class="p-4 border-t border-slate-700 text-center">
+                <p class="text-xs text-slate-600">IndexTTS v1.5 API Interface</p>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="flex-1 flex flex-col h-full relative">
+            <!-- 頂部區：文字輸入 -->
+            <div class="flex-1 p-8 overflow-y-auto custom-scrollbar pb-32">
+                <div class="max-w-4xl mx-auto w-full">
+                    <h2 class="text-lg font-medium text-white mb-4 flex items-center gap-2">
+                        <i class="ph ph-text-t"></i> 輸入文字
+                    </h2>
+                    <div class="relative group">
+                        <textarea 
+                            v-model="inputText"
+                            class="w-full h-64 bg-surface border border-slate-700 rounded-xl p-6 text-lg leading-relaxed text-slate-200 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary transition-all resize-none shadow-lg placeholder-slate-600"
+                            placeholder="請在此輸入您想要合成的文字內容..."
+                        ></textarea>
+                        <div class="absolute bottom-4 right-4 text-xs text-slate-500">
+                            {{ inputText.length }} 字
+                        </div>
+                    </div>
+
+                    <!-- Action Bar -->
+                    <div class="mt-6 flex justify-end gap-4">
+                        <button @click="clearText" class="px-4 py-2 text-slate-400 hover:text-white transition-colors text-sm">
+                            清除
+                        </button>
+                        <button 
+                            @click="generate" 
+                            :disabled="isGenerating || (!inputText.trim())"
+                            class="bg-gradient-to-r from-primary to-secondary hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed text-white px-8 py-3 rounded-lg font-semibold shadow-lg shadow-primary/20 flex items-center gap-2 transition-all transform active:scale-95"
+                        >
+                            <i v-if="isGenerating" class="ph ph-spinner animate-spin text-xl"></i>
+                            <i v-else class="ph ph-play-circle text-xl"></i>
+                            {{ isGenerating ? '生成中...' : '開始合成' }}
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 底部區：播放器與歷史 -->
+            <div class="h-80 bg-surface border-t border-slate-700 shadow-[0_-4px_20px_rgba(0,0,0,0.3)] z-10 flex flex-col">
+                <!-- 波形顯示 -->
+                <div class="h-24 bg-dark/50 relative group">
+                    <div id="waveform" class="w-full h-full"></div>
+                    <div class="absolute inset-0 flex items-center justify-center pointer-events-none" v-if="!currentAudioUrl">
+                        <p class="text-slate-600 text-sm">等待生成音訊...</p>
+                    </div>
+                    <!-- 播放控制覆蓋層：改為常駐顯示，生成後立刻可見 -->
+                    <div v-if="currentAudioUrl" class="absolute inset-0 bg-black/0 group-hover:bg-black/10 transition-colors flex items-center justify-center pointer-events-none">
+                        <button class="bg-white/20 backdrop-blur rounded-full p-3 pointer-events-auto hover:bg-white/30 transition" @click="togglePlay">
+                            <i :class="isPlaying ? 'ph-pause-fill' : 'ph-play-fill'" class="ph text-white text-2xl"></i>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- 播放控制列（常駐；移到波形下方，不遮蓋內容） -->
+                <div class="px-6 py-3 border-b border-slate-700 flex items-center gap-4 bg-surface">
+                    <button @click="togglePlay" :disabled="!currentAudioUrl"
+                        class="bg-primary/80 hover:bg-primary text-white px-4 py-2 rounded-lg disabled:opacity-50 flex items-center gap-2 transition">
+                        <i :class="isPlaying ? 'ph-pause' : 'ph-play'" class="ph"></i>
+                        <span class="text-sm">{{ isPlaying ? '暫停' : '播放' }}</span>
+                    </button>
+                    <div class="text-xs text-slate-400" v-if="currentAudioUrl">
+                        <i class="ph ph-wave-sine mr-1"></i>已載入音訊，點擊播放
+                    </div>
+                </div>
+
+                <!-- 歷史記錄列表 -->
+                <div class="flex-1 overflow-hidden flex flex-col">
+                    <div class="px-6 py-3 border-b border-slate-700 flex justify-between items-center bg-surface">
+                        <h3 class="text-sm font-semibold text-slate-300 flex items-center gap-2">
+                            <i class="ph ph-clock-counter-clockwise"></i> 生成歷史
+                        </h3>
+                        <button @click="history = []" class="text-xs text-slate-500 hover:text-red-400">清空歷史</button>
+                    </div>
+                    <div class="flex-1 overflow-y-auto custom-scrollbar p-2 space-y-2">
+                        <div v-for="(item, idx) in history" :key="idx" 
+                             class="bg-dark/50 hover:bg-dark border border-slate-700/50 rounded-lg p-3 flex items-center gap-4 cursor-pointer transition-colors group"
+                             :class="{'border-primary/50 bg-dark': currentAudioUrl === item.url}"
+                             @click="playHistory(item)">
+                            
+                            <div class="w-8 h-8 rounded-full bg-slate-700 flex items-center justify-center text-slate-400 text-xs font-mono">
+                                {{ history.length - idx }}
+                            </div>
+                            
+                            <div class="flex-1 min-w-0">
+                                <p class="text-sm text-slate-200 truncate">{{ item.text }}</p>
+                                <p class="text-xs text-slate-500 mt-0.5 flex gap-3">
+                                    <span><i class="ph ph-clock"></i> {{ item.time }}</span>
+                                    <span><i class="ph ph-lightning"></i> {{ item.mode }}</span>
+                                    <span><i class="ph ph-timer"></i> {{ item.duration }}s</span>
+                                </p>
+                            </div>
+
+                            <div class="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                                <a :href="item.url" :download="`tts_${item.id}.wav`" class="p-2 text-slate-400 hover:text-primary hover:bg-white/5 rounded" @click.stop>
+                                    <i class="ph ph-download-simple"></i>
+                                </a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        const { createApp, ref, onMounted, watch } = Vue;
+
+        createApp({
+            setup() {
+                const inputText = ref("");
+                const isGenerating = ref(false);
+                const models = ref([]);
+                const selectedModel = ref("");
+                const loadingModel = ref(false);
+                const promptFile = ref(null);
+                const serverPromptPath = ref("");
+                const currentAudioUrl = ref(null);
+                const isPlaying = ref(false);
+                const wavesurfer = ref(null);
+                const history = ref([]);
+
+                // 參數設定
+                const params = ref({
+                    infer_mode: "fast",
+                    max_text_tokens_per_sentence: 120,
+                    sentences_bucket_max_size: 4,
+                    do_sample: true,
+                    top_p: 0.8,
+                    top_k: 30,
+                    temperature: 1.0,
+                    repetition_penalty: 10.0,
+                    max_mel_tokens: 600,
+                });
+
+                const sliders = {
+                    temperature: { label: "Temperature", min: 0.1, max: 2.0, step: 0.1 },
+                    top_p: { label: "Top-P", min: 0.0, max: 1.0, step: 0.01 },
+                    top_k: { label: "Top-K", min: 0, max: 100, step: 1 },
+                    repetition_penalty: { label: "Repetition Penalty", min: 0.1, max: 20.0, step: 0.1 },
+                    max_text_tokens_per_sentence: { label: "Max Tokens/Sentence", min: 20, max: 500, step: 10 },
+                };
+
+                onMounted(async () => {
+                    // 初始化 Wavesurfer
+                    wavesurfer.value = WaveSurfer.create({
+                        container: '#waveform',
+                        waveColor: '#475569',
+                        progressColor: '#6366f1',
+                        cursorColor: '#818cf8',
+                        barWidth: 2,
+                        barGap: 1,
+                        barRadius: 2,
+                        height: 96,
+                        normalize: true,
+                    });
+                    
+                    wavesurfer.value.on('finish', () => isPlaying.value = false);
+                    wavesurfer.value.on('play', () => isPlaying.value = true);
+                    wavesurfer.value.on('pause', () => isPlaying.value = false);
+
+                    // 載入模型列表
+                    await fetchModels();
+                });
+
+                const fetchModels = async () => {
+                    try {
+                        const res = await fetch('/models');
+                        const data = await res.json();
+                        models.value = data.models;
+                        // 嘗試選中當前模型
+                        const current = data.models.find(m => m.filename.endsWith(data.current_model));
+                        if (current) selectedModel.value = current.filename;
+                        else if (models.value.length > 0) selectedModel.value = models.value[0].filename;
+                    } catch (e) {
+                        console.error("載入模型列表失敗", e);
+                    }
+                };
+
+                const changeModel = async () => {
+                    if (!selectedModel.value) return;
+                    loadingModel.value = true;
+                    try {
+                        await fetch('/model/reload', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ model_filename: selectedModel.value })
+                        });
+                    } catch (e) {
+                        alert("模型切換失敗: " + e.message);
+                    } finally {
+                        loadingModel.value = false;
+                    }
+                };
+
+                const handleFileSelect = (e) => {
+                    if (e.target.files.length > 0) {
+                        promptFile.value = e.target.files[0];
+                        serverPromptPath.value = ""; // 清除伺服器路徑選擇
+                    }
+                };
+
+                const handleDrop = (e) => {
+                    if (e.dataTransfer.files.length > 0) {
+                        promptFile.value = e.dataTransfer.files[0];
+                        serverPromptPath.value = "";
+                    }
+                };
+
+                // 當選擇伺服器範例時，清除上傳檔案
+                watch(serverPromptPath, (newVal) => {
+                    if (newVal) promptFile.value = null;
+                });
+
+                const generate = async () => {
+                    if (!inputText.value.trim()) return;
+                    if (!promptFile.value && !serverPromptPath.value) {
+                        alert("請選擇參考音訊！");
+                        return;
+                    }
+
+                    isGenerating.value = true;
+                    const startTime = Date.now();
+
+                    const formData = new FormData();
+                    formData.append('text', inputText.value);
+                    formData.append('infer_mode', params.value.infer_mode);
+                    
+                    if (promptFile.value) {
+                        formData.append('prompt_audio', promptFile.value);
+                    } else {
+                        formData.append('prompt_audio_path', serverPromptPath.value);
+                    }
+
+                    // Append all params
+                    for (const [key, val] of Object.entries(params.value)) {
+                        formData.append(key, val);
+                    }
+
+                    try {
+                        const res = await fetch('/tts', {
+                            method: 'POST',
+                            body: formData
+                        });
+
+                        if (!res.ok) throw new Error(await res.text());
+
+                        const blob = await res.blob();
+                        const url = URL.createObjectURL(blob);
+                        
+                        // 更新播放器
+                        currentAudioUrl.value = url;
+                        wavesurfer.value.load(url);
+                        wavesurfer.value.on('ready', () => {
+                            wavesurfer.value.play();
+                        });
+
+                        // 加入歷史記錄
+                        const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+                        history.value.unshift({
+                            id: Date.now(),
+                            text: inputText.value,
+                            url: url,
+                            time: new Date().toLocaleTimeString(),
+                            duration: duration,
+                            mode: params.value.infer_mode
+                        });
+
+                    } catch (e) {
+                        alert("生成失敗: " + e.message);
+                    } finally {
+                        isGenerating.value = false;
+                    }
+                };
+
+                const togglePlay = () => {
+                    if (wavesurfer.value) wavesurfer.value.playPause();
+                };
+
+                const playHistory = (item) => {
+                    currentAudioUrl.value = item.url;
+                    wavesurfer.value.load(item.url);
+                    wavesurfer.value.on('ready', () => wavesurfer.value.play());
+                };
+
+                const clearText = () => inputText.value = "";
+
+                return {
+                    inputText,
+                    isGenerating,
+                    models,
+                    selectedModel,
+                    loadingModel,
+                    promptFile,
+                    serverPromptPath,
+                    params,
+                    sliders,
+                    currentAudioUrl,
+                    isPlaying,
+                    history,
+                    changeModel,
+                    handleFileSelect,
+                    handleDrop,
+                    generate,
+                    togglePlay,
+                    playHistory,
+                    clearText
+                };
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>

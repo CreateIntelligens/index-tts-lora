@@ -24,19 +24,18 @@ from torch import nn
 
 
 class MultiHeadedAttention(nn.Module):
-    """Multi-Head Attention layer.
+    """
+    多頭注意力層 (Multi-Head Attention layer)。
 
     Args:
-        n_head (int): The number of heads.
-        n_feat (int): The number of features.
-        dropout_rate (float): Dropout rate.
-
+        n_head (int): 注意力頭數。
+        n_feat (int): 特徵維度。
+        dropout_rate (float): Dropout 比率。
     """
     def __init__(self, n_head: int, n_feat: int, dropout_rate: float):
-        """Construct an MultiHeadedAttention object."""
         super().__init__()
         assert n_feat % n_head == 0
-        # We assume d_v always equals d_k
+        # 假設 d_v 始終等於 d_k
         self.d_k = n_feat // n_head
         self.h = n_head
         self.linear_q = nn.Linear(n_feat, n_feat)
@@ -48,21 +47,17 @@ class MultiHeadedAttention(nn.Module):
     def forward_qkv(
         self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Transform query, key and value.
+        """
+        轉換 Query, Key 與 Value。
 
         Args:
-            query (torch.Tensor): Query tensor (#batch, time1, size).
-            key (torch.Tensor): Key tensor (#batch, time2, size).
-            value (torch.Tensor): Value tensor (#batch, time2, size).
+            query (torch.Tensor): Query 張量 (#batch, time1, size)。
+            key (torch.Tensor): Key 張量 (#batch, time2, size)。
+            value (torch.Tensor): Value 張量 (#batch, time2, size)。
 
         Returns:
-            torch.Tensor: Transformed query tensor, size
-                (#batch, n_head, time1, d_k).
-            torch.Tensor: Transformed key tensor, size
-                (#batch, n_head, time2, d_k).
-            torch.Tensor: Transformed value tensor, size
-                (#batch, n_head, time2, d_k).
-
+            Tuple[torch.Tensor, ...]: 轉換後的 Q, K, V 張量。
+                尺寸皆為 (#batch, n_head, time, d_k)。
         """
         n_batch = query.size(0)
         q = self.linear_q(query).view(n_batch, -1, self.h, self.d_k)
@@ -78,36 +73,26 @@ class MultiHeadedAttention(nn.Module):
         self, value: torch.Tensor, scores: torch.Tensor,
         mask: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool)
     ) -> torch.Tensor:
-        """Compute attention context vector.
+        """
+        計算注意力上下文向量。
 
         Args:
-            value (torch.Tensor): Transformed value, size
-                (#batch, n_head, time2, d_k).
-            scores (torch.Tensor): Attention score, size
-                (#batch, n_head, time1, time2).
-            mask (torch.Tensor): Mask, size (#batch, 1, time2) or
-                (#batch, time1, time2), (0, 0, 0) means fake mask.
+            value (torch.Tensor): 轉換後的 Value (#batch, n_head, time2, d_k)。
+            scores (torch.Tensor): 注意力分數 (#batch, n_head, time1, time2)。
+            mask (torch.Tensor): 遮罩張量，支援 (#batch, 1, time2) 或 (#batch, time1, time2)。
 
         Returns:
-            torch.Tensor: Transformed value (#batch, time1, d_model)
-                weighted by the attention score (#batch, time1, time2).
-
+            torch.Tensor: 加權後的 Value (#batch, time1, d_model)。
         """
         n_batch = value.size(0)
-        # NOTE(xcsong): When will `if mask.size(2) > 0` be True?
-        #   1. onnx(16/4) [WHY? Because we feed real cache & real mask for the
-        #           1st chunk to ease the onnx export.]
-        #   2. pytorch training
+        
         if mask.size(2) > 0 :  # time2 > 0
             mask = mask.unsqueeze(1).eq(0)  # (batch, 1, *, time2)
-            # For last chunk, time2 might be larger than scores.size(-1)
+            # 對於最後一個 chunk，time2 可能大於 scores 的最後一維
             mask = mask[:, :, :, :scores.size(-1)]  # (batch, 1, *, time2)
             scores = scores.masked_fill(mask, -float('inf'))
             attn = torch.softmax(scores, dim=-1).masked_fill(
                 mask, 0.0)  # (batch, head, time1, time2)
-        # NOTE(xcsong): When will `if mask.size(2) > 0` be False?
-        #   1. onnx(16/-1, -1/-1, 16/0)
-        #   2. jit (16/-1, -1/-1, 16/0, 16/4)
         else:
             attn = torch.softmax(scores, dim=-1)  # (batch, head, time1, time2)
 
@@ -125,61 +110,28 @@ class MultiHeadedAttention(nn.Module):
                 pos_emb: torch.Tensor = torch.empty(0),
                 cache: torch.Tensor = torch.zeros((0, 0, 0, 0))
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute scaled dot product attention.
+        """
+        計算縮放點積注意力 (Scaled Dot Product Attention)。
 
         Args:
-            query (torch.Tensor): Query tensor (#batch, time1, size).
-            key (torch.Tensor): Key tensor (#batch, time2, size).
-            value (torch.Tensor): Value tensor (#batch, time2, size).
-            mask (torch.Tensor): Mask tensor (#batch, 1, time2) or
-                (#batch, time1, time2).
-                1.When applying cross attention between decoder and encoder,
-                the batch padding mask for input is in (#batch, 1, T) shape.
-                2.When applying self attention of encoder,
-                the mask is in (#batch, T, T)  shape.
-                3.When applying self attention of decoder,
-                the mask is in (#batch, L, L)  shape.
-                4.If the different position in decoder see different block
-                of the encoder, such as Mocha, the passed in mask could be
-                in (#batch, L, T) shape. But there is no such case in current
-                Wenet.
-            cache (torch.Tensor): Cache tensor (1, head, cache_t, d_k * 2),
-                where `cache_t == chunk_size * num_decoding_left_chunks`
-                and `head * d_k == size`
-
+            query (torch.Tensor): Query (#batch, time1, size)。
+            key (torch.Tensor): Key (#batch, time2, size)。
+            value (torch.Tensor): Value (#batch, time2, size)。
+            mask (torch.Tensor): 遮罩張量。
+            cache (torch.Tensor): 快取張量 (1, head, cache_t, d_k * 2)。
 
         Returns:
-            torch.Tensor: Output tensor (#batch, time1, d_model).
-            torch.Tensor: Cache tensor (1, head, cache_t + time1, d_k * 2)
-                where `cache_t == chunk_size * num_decoding_left_chunks`
-                and `head * d_k == size`
-
+            torch.Tensor: 輸出張量 (#batch, time1, d_model)。
+            torch.Tensor: 更新後的快取張量。
         """
         q, k, v = self.forward_qkv(query, key, value)
 
-        # NOTE(xcsong):
-        #   when export onnx model, for 1st chunk, we feed
-        #       cache(1, head, 0, d_k * 2) (16/-1, -1/-1, 16/0 mode)
-        #       or cache(1, head, real_cache_t, d_k * 2) (16/4 mode).
-        #       In all modes, `if cache.size(0) > 0` will alwayse be `True`
-        #       and we will always do splitting and
-        #       concatnation(this will simplify onnx export). Note that
-        #       it's OK to concat & split zero-shaped tensors(see code below).
-        #   when export jit  model, for 1st chunk, we always feed
-        #       cache(0, 0, 0, 0) since jit supports dynamic if-branch.
-        # >>> a = torch.ones((1, 2, 0, 4))
-        # >>> b = torch.ones((1, 2, 3, 4))
-        # >>> c = torch.cat((a, b), dim=2)
-        # >>> torch.equal(b, c)        # True
-        # >>> d = torch.split(a, 2, dim=-1)
-        # >>> torch.equal(d[0], d[1])  # True
         if cache.size(0) > 0:
             key_cache, value_cache = torch.split(
                 cache, cache.size(-1) // 2, dim=-1)
             k = torch.cat([key_cache, k], dim=2)
             v = torch.cat([value_cache, v], dim=2)
-        # NOTE(xcsong): We do cache slicing in encoder.forward_chunk, since it's
-        #   non-trivial to calculate `next_cache_start` here.
+        
         new_cache = torch.cat((k, v), dim=-1)
 
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
@@ -187,33 +139,35 @@ class MultiHeadedAttention(nn.Module):
 
 
 class RelPositionMultiHeadedAttention(MultiHeadedAttention):
-    """Multi-Head Attention layer with relative position encoding.
+    """
+    帶有相對位置編碼的多頭注意力層。
     Paper: https://arxiv.org/abs/1901.02860
+
     Args:
-        n_head (int): The number of heads.
-        n_feat (int): The number of features.
-        dropout_rate (float): Dropout rate.
+        n_head (int): 注意力頭數。
+        n_feat (int): 特徵維度。
+        dropout_rate (float): Dropout 比率。
     """
     def __init__(self, n_head, n_feat, dropout_rate):
-        """Construct an RelPositionMultiHeadedAttention object."""
         super().__init__(n_head, n_feat, dropout_rate)
-        # linear transformation for positional encoding
+        # 位置編碼的線性變換
         self.linear_pos = nn.Linear(n_feat, n_feat, bias=False)
-        # these two learnable bias are used in matrix c and matrix d
-        # as described in https://arxiv.org/abs/1901.02860 Section 3.3
+        # 兩個可學習的偏置參數 u 和 v
         self.pos_bias_u = nn.Parameter(torch.Tensor(self.h, self.d_k))
         self.pos_bias_v = nn.Parameter(torch.Tensor(self.h, self.d_k))
         torch.nn.init.xavier_uniform_(self.pos_bias_u)
         torch.nn.init.xavier_uniform_(self.pos_bias_v)
 
     def rel_shift(self, x, zero_triu: bool = False):
-        """Compute relative positinal encoding.
+        """
+        計算相對位置編碼的移位操作。
+
         Args:
-            x (torch.Tensor): Input tensor (batch, time, size).
-            zero_triu (bool): If true, return the lower triangular part of
-                the matrix.
+            x (torch.Tensor): 輸入張量 (batch, time, size)。
+            zero_triu (bool): 是否將下三角部分置零。
+
         Returns:
-            torch.Tensor: Output tensor.
+            torch.Tensor: 輸出張量。
         """
 
         zero_pad = torch.zeros((x.size()[0], x.size()[1], x.size()[2], 1),
@@ -238,50 +192,30 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
                 pos_emb: torch.Tensor = torch.empty(0),
                 cache: torch.Tensor = torch.zeros((0, 0, 0, 0))
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute 'Scaled Dot Product Attention' with rel. positional encoding.
+        """
+        計算帶有相對位置編碼的縮放點積注意力。
+
         Args:
-            query (torch.Tensor): Query tensor (#batch, time1, size).
-            key (torch.Tensor): Key tensor (#batch, time2, size).
-            value (torch.Tensor): Value tensor (#batch, time2, size).
-            mask (torch.Tensor): Mask tensor (#batch, 1, time2) or
-                (#batch, time1, time2), (0, 0, 0) means fake mask.
-            pos_emb (torch.Tensor): Positional embedding tensor
-                (#batch, time2, size).
-            cache (torch.Tensor): Cache tensor (1, head, cache_t, d_k * 2),
-                where `cache_t == chunk_size * num_decoding_left_chunks`
-                and `head * d_k == size`
+            query (torch.Tensor): Query (#batch, time1, size)。
+            key (torch.Tensor): Key (#batch, time2, size)。
+            value (torch.Tensor): Value (#batch, time2, size)。
+            mask (torch.Tensor): 遮罩張量。
+            pos_emb (torch.Tensor): 位置嵌入張量 (#batch, time2, size)。
+            cache (torch.Tensor): 快取張量。
+
         Returns:
-            torch.Tensor: Output tensor (#batch, time1, d_model).
-            torch.Tensor: Cache tensor (1, head, cache_t + time1, d_k * 2)
-                where `cache_t == chunk_size * num_decoding_left_chunks`
-                and `head * d_k == size`
+            torch.Tensor: 輸出張量 (#batch, time1, d_model)。
+            torch.Tensor: 更新後的快取張量。
         """
         q, k, v = self.forward_qkv(query, key, value)
         q = q.transpose(1, 2)  # (batch, time1, head, d_k)
 
-        # NOTE(xcsong):
-        #   when export onnx model, for 1st chunk, we feed
-        #       cache(1, head, 0, d_k * 2) (16/-1, -1/-1, 16/0 mode)
-        #       or cache(1, head, real_cache_t, d_k * 2) (16/4 mode).
-        #       In all modes, `if cache.size(0) > 0` will alwayse be `True`
-        #       and we will always do splitting and
-        #       concatnation(this will simplify onnx export). Note that
-        #       it's OK to concat & split zero-shaped tensors(see code below).
-        #   when export jit  model, for 1st chunk, we always feed
-        #       cache(0, 0, 0, 0) since jit supports dynamic if-branch.
-        # >>> a = torch.ones((1, 2, 0, 4))
-        # >>> b = torch.ones((1, 2, 3, 4))
-        # >>> c = torch.cat((a, b), dim=2)
-        # >>> torch.equal(b, c)        # True
-        # >>> d = torch.split(a, 2, dim=-1)
-        # >>> torch.equal(d[0], d[1])  # True
         if cache.size(0) > 0:
             key_cache, value_cache = torch.split(
                 cache, cache.size(-1) // 2, dim=-1)
             k = torch.cat([key_cache, k], dim=2)
             v = torch.cat([value_cache, v], dim=2)
-        # NOTE(xcsong): We do cache slicing in encoder.forward_chunk, since it's
-        #   non-trivial to calculate `next_cache_start` here.
+        
         new_cache = torch.cat((k, v), dim=-1)
 
         n_batch_pos = pos_emb.size(0)
@@ -293,19 +227,15 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         # (batch, head, time1, d_k)
         q_with_bias_v = (q + self.pos_bias_v).transpose(1, 2)
 
-        # compute attention score
-        # first compute matrix a and matrix c
-        # as described in https://arxiv.org/abs/1901.02860 Section 3.3
+        # 計算注意力分數
+        # matrix_ac: term (a) + term (c)
         # (batch, head, time1, time2)
         matrix_ac = torch.matmul(q_with_bias_u, k.transpose(-2, -1))
 
-        # compute matrix b and matrix d
+        # matrix_bd: term (b) + term (d)
         # (batch, head, time1, time2)
         matrix_bd = torch.matmul(q_with_bias_v, p.transpose(-2, -1))
-        # Remove rel_shift since it is useless in speech recognition,
-        # and it requires special attention for streaming.
-        # matrix_bd = self.rel_shift(matrix_bd)
-
+        
         scores = (matrix_ac + matrix_bd) / math.sqrt(
             self.d_k)  # (batch, head, time1, time2)
 

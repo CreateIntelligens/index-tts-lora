@@ -29,7 +29,9 @@ services:
 
     # 端口映射
     ports:
-      - "7860:7860"
+      - "7860:7860"  # webui
+      - "7859:7859"  # api.py
+      - "7859:7859"  # API Port
 
     # 掛載卷 - 掛載整個專案目錄
     volumes:
@@ -44,8 +46,8 @@ services:
     # 共享內存大小（DataLoader 多進程需要）
     shm_size: '128gb'
 
-    # 默認啟動 WebUI (entrypoint.sh 會先檢查模型)
-    command: python3 webui.py --host 0.0.0.0 --port 7860
+    # 同時啟動 API (7859) 和 WebUI (7860)
+    command: bash scripts/start_all.sh
 
     # 自動重啟策略（包含健康檢查失敗時）
     restart: unless-stopped

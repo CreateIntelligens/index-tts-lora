@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-GPU 管理器 - 自動偵測和分配多 GPU 資源
+GPU 管理器 - 自動偵測與分配 GPU 資源。
 
 功能：
-- 自動偵測可用 GPU 數量和狀態
-- 智能分配 GPU 給不同 worker
-- 記憶體使用監控
-- 負載均衡
-
-Author: TTS ETL Pipeline
-Version: 1.0
+- 自動偵測可用 GPU 數量與狀態
+- 智慧分配 GPU 給不同的 Worker
+- 監控記憶體使用
+- 負載平衡
 """
 
 import os
@@ -20,13 +17,13 @@ from dataclasses import dataclass
 try:
     import torch
 except ImportError:
-    print("❌ 請安裝 PyTorch: pip install torch")
+    print("[錯誤] 請安裝 PyTorch: pip install torch")
     raise
 
 
 @dataclass
 class GPUInfo:
-    """GPU 資訊"""
+    """GPU 資訊類別"""
     index: int
     name: str
     total_memory: float  # GB
@@ -48,25 +45,22 @@ class GPUManager:
     def _detect_gpus(self):
         """偵測可用的 GPU"""
         if not torch.cuda.is_available():
-            self.logger.warning("⚠️  未偵測到 CUDA GPU，將使用 CPU 模式")
+            self.logger.warning("[警告] 未偵測到 CUDA GPU，將使用 CPU 模式")
             return
 
-        # 檢查是否有 CUDA_VISIBLE_DEVICES 限制
         cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
         if cuda_visible:
-            self.logger.info(f"🔧 CUDA_VISIBLE_DEVICES 設定: {cuda_visible}")
+            self.logger.info(f"[資訊] CUDA_VISIBLE_DEVICES 設定: {cuda_visible}")
 
         self.gpu_count = torch.cuda.device_count()
-        self.logger.info(f"🎮 偵測到 {self.gpu_count} 個 GPU")
+        self.logger.info(f"[資訊] 偵測到 {self.gpu_count} 個 GPU")
 
-        # 收集每個 GPU 的資訊
         for i in range(self.gpu_count):
             try:
                 props = torch.cuda.get_device_properties(i)
                 name = props.name
-                total_memory = props.total_memory / (1024**3)  # 轉換為 GB
+                total_memory = props.total_memory / (1024**3)
 
-                # 嘗試獲取當前可用記憶體
                 torch.cuda.set_device(i)
                 allocated = torch.cuda.memory_allocated(i) / (1024**3)
                 reserved = torch.cuda.memory_reserved(i) / (1024**3)
@@ -77,7 +71,7 @@ class GPUManager:
                     name=name,
                     total_memory=total_memory,
                     available_memory=available,
-                    utilization=0.0  # PyTorch 沒有直接的利用率 API
+                    utilization=0.0
                 )
 
                 self.gpu_info.append(gpu_info)
@@ -89,7 +83,7 @@ class GPUManager:
                 )
 
             except Exception as e:
-                self.logger.warning(f"⚠️  無法讀取 GPU {i} 資訊: {e}")
+                self.logger.warning(f"[警告] 無法讀取 GPU {i} 資訊: {e}")
 
     def get_gpu_count(self) -> int:
         """獲取可用 GPU 數量"""
@@ -107,76 +101,72 @@ class GPUManager:
 
     def assign_gpu_to_worker(self, worker_id: int) -> int:
         """
-        為 worker 分配 GPU
+        為 Worker 分配 GPU。
 
-        策略：輪詢分配 (round-robin)
+        策略：輪詢分配 (Round-Robin)。
 
         Args:
-            worker_id: Worker 編號
+            worker_id: Worker 編號。
 
         Returns:
-            分配的 GPU ID
+            分配的 GPU ID。
         """
         if self.gpu_count == 0:
-            return -1  # 無 GPU 可用
+            return -1
 
         gpu_id = self.enabled_gpus[worker_id % self.gpu_count]
-        self.logger.debug(f"🔧 Worker {worker_id} → GPU {gpu_id}")
+        self.logger.debug(f"[分配] Worker {worker_id} -> GPU {gpu_id}")
         return gpu_id
 
     def get_optimal_worker_count(self,
                                   memory_per_worker: float = 4.0,
                                   max_workers: Optional[int] = None) -> int:
         """
-        計算最佳 worker 數量
+        計算最佳 Worker 數量。
 
         Args:
-            memory_per_worker: 每個 worker 預計使用的記憶體 (GB)
-            max_workers: 最大 worker 數量限制
+            memory_per_worker: 每個 Worker 預計使用的記憶體 (GB)。
+            max_workers: 最大 Worker 數量限制。
 
         Returns:
-            建議的 worker 數量
+            建議的 Worker 數量。
         """
         if self.gpu_count == 0:
-            # CPU 模式：基於 CPU 核心數
             import multiprocessing
             cpu_count = multiprocessing.cpu_count()
             workers = max(1, cpu_count // 2)
-            self.logger.info(f"💡 CPU 模式：建議 {workers} 個 worker")
+            self.logger.info(f"[建議] CPU 模式：建議 {workers} 個 Worker")
             return workers
 
-        # 計算每個 GPU 可以支援的 worker 數
         workers_per_gpu = []
         for gpu in self.gpu_info:
             available_workers = max(1, int(gpu.available_memory / memory_per_worker))
             workers_per_gpu.append(available_workers)
 
-        # 總 worker 數 = 每個 GPU 的 worker 數總和
         total_workers = sum(workers_per_gpu)
 
-        # 應用最大限制
         if max_workers is not None:
             total_workers = min(total_workers, max_workers)
 
-        self.logger.info(f"📊 GPU 資源分析：")
+        self.logger.info(f"[分析] GPU 資源分析：")
         for i, (gpu, workers) in enumerate(zip(self.gpu_info, workers_per_gpu)):
             self.logger.info(
                 f"  GPU {i} ({gpu.name}): "
-                f"{gpu.available_memory:.1f}GB 可用 → {workers} workers"
+                f"{gpu.available_memory:.1f}GB 可用 -> {workers} Workers"
             )
-        self.logger.info(f"💡 建議總 worker 數: {total_workers}")
+        self.logger.info(f"[建議] 總 Worker 數: {total_workers}")
 
         return total_workers
 
     def get_device_string(self, gpu_id: int) -> str:
         """
-        獲取 PyTorch device 字串
+        獲取 PyTorch Device 字串。
 
         Args:
-            gpu_id: GPU ID (-1 表示 CPU)
+            gpu_id: GPU ID (-1 表示 CPU)。
 
         Returns:
-            device 字串 (例如: "cuda:0", "cpu")
+            Device 字串 (例如: "cuda:0", "cpu")。
         """
         if gpu_id < 0 or self.gpu_count == 0:
             return "cpu"
@@ -184,25 +174,25 @@ class GPUManager:
 
     def set_cuda_visible_devices(self, gpu_ids: List[int]):
         """
-        設定 CUDA_VISIBLE_DEVICES 環境變數
+        設定 CUDA_VISIBLE_DEVICES 環境變數。
 
-        注意：必須在初始化 CUDA 前調用才有效
+        注意：必須在初始化 CUDA 前調用才有效。
 
         Args:
-            gpu_ids: 要使用的 GPU ID 列表
+            gpu_ids: 要使用的 GPU ID 列表。
         """
         gpu_str = ",".join(map(str, gpu_ids))
         os.environ['CUDA_VISIBLE_DEVICES'] = gpu_str
-        self.logger.info(f"🔧 設定 CUDA_VISIBLE_DEVICES={gpu_str}")
+        self.logger.info(f"[設定] CUDA_VISIBLE_DEVICES={gpu_str}")
 
     def print_summary(self):
-        """打印 GPU 狀態摘要"""
+        """列印 GPU 狀態摘要"""
         print("\n" + "="*60)
         print("🎮 GPU 資源摘要")
         print("="*60)
 
         if self.gpu_count == 0:
-            print("⚠️  未偵測到 GPU，將使用 CPU 模式")
+            print("[警告] 未偵測到 GPU，將使用 CPU 模式")
             return
 
         print(f"📊 可用 GPU 數量: {self.gpu_count}")
@@ -218,13 +208,12 @@ class GPUManager:
 
 
 def get_global_gpu_manager() -> GPUManager:
-    """獲取全局 GPU 管理器實例（單例模式）"""
+    """獲取全域 GPU 管理器實例 (單例模式)"""
     if not hasattr(get_global_gpu_manager, '_instance'):
         get_global_gpu_manager._instance = GPUManager()
     return get_global_gpu_manager._instance
 
 
-# 便捷函數
 def get_available_gpu_count() -> int:
     """快速獲取可用 GPU 數量"""
     manager = get_global_gpu_manager()
@@ -232,26 +221,24 @@ def get_available_gpu_count() -> int:
 
 
 def assign_worker_gpu(worker_id: int) -> str:
-    """快速為 worker 分配 GPU 並返回 device 字串"""
+    """快速為 Worker 分配 GPU 並返回 Device 字串"""
     manager = get_global_gpu_manager()
     gpu_id = manager.assign_gpu_to_worker(worker_id)
     return manager.get_device_string(gpu_id)
 
 
 if __name__ == "__main__":
-    # 測試 GPU 管理器
     logging.basicConfig(level=logging.INFO)
 
     manager = GPUManager()
     manager.print_summary()
 
-    # 測試 worker 分配
     if manager.get_gpu_count() > 0:
         print("🧪 測試 Worker 分配：")
         for i in range(10):
             device = assign_worker_gpu(i)
-            print(f"  Worker {i} → {device}")
+            print(f"  Worker {i} -> {device}")
 
         print()
         optimal = manager.get_optimal_worker_count(memory_per_worker=4.0)
-        print(f"💡 建議 worker 數量: {optimal}")
+        print(f"💡 建議 Worker 數量: {optimal}")

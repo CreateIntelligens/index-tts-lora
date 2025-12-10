@@ -45,9 +45,9 @@ class Attend(nn.Module):
         self.use_flash = use_flash
         assert not (
             use_flash and version.parse(torch.__version__) < version.parse("2.0.0")
-        ), "in order to use flash attention, you must be using pytorch 2.0 or above"
+        ), "欲使用 Flash Attention，必須使用 PyTorch 2.0 或以上版本。"
 
-        # determine efficient attention configs for cuda and cpu
+        # 設定 Efficient Attention 配置
         self.config = namedtuple("EfficientAttentionConfig", ["enable_flash", "enable_math", "enable_mem_efficient"])
         self.cpu_config = self.config(True, True, True)
         self.cuda_config = None
@@ -58,10 +58,10 @@ class Attend(nn.Module):
         device_properties = torch.cuda.get_device_properties(torch.device("cuda"))
 
         if device_properties.major == 8 and device_properties.minor == 0:
-            print_once("A100 GPU detected, using flash attention if input tensor is on cuda")
+            print_once("[系統] 偵測到 A100 GPU，若輸入張量在 CUDA 上將啟用 Flash Attention。")
             self.cuda_config = self.config(True, False, False)
         else:
-            print_once("Non-A100 GPU detected, using math or mem efficient attention if input tensor is on cuda")
+            print_once("[系統] 偵測到非 A100 GPU，若輸入張量在 CUDA 上將使用 Math 或 Memory Efficient Attention。")
             self.cuda_config = self.config(False, True, True)
 
     def get_mask(self, n, device):
@@ -75,8 +75,8 @@ class Attend(nn.Module):
     def flash_attn(self, q, k, v, mask=None):
         _, heads, q_len, _, k_len, is_cuda = *q.shape, k.shape[-2], q.is_cuda
 
-        # Recommended for multi-query single-key-value attention by Tri Dao
-        # kv shape torch.Size([1, 512, 64]) -> torch.Size([1, 8, 512, 64])
+        # 建議用於 Multi-query single-key-value attention (Tri Dao)
+        # kv shape: torch.Size([1, 512, 64]) -> torch.Size([1, 8, 512, 64])
 
         if k.ndim == 3:
             k = rearrange(k, "b ... -> b 1 ...").expand_as(q)
@@ -84,8 +84,8 @@ class Attend(nn.Module):
         if v.ndim == 3:
             v = rearrange(v, "b ... -> b 1 ...").expand_as(q)
 
-        # Check if mask exists and expand to compatible shape
-        # The mask is B L, so it would have to be expanded to B H N L
+        # 檢查 Mask 並擴充套件至相容形狀
+        # Mask 形狀為 B L，需擴充套件至 B H N L
 
         if exists(mask):
             mask = rearrange(mask, "b j -> b 1 1 j")
@@ -106,10 +106,10 @@ class Attend(nn.Module):
 
     def forward(self, q, k, v, mask=None):
         """
-        einstein notation
+        Einstein Notation:
         b - batch
         h - heads
-        n, i, j - sequence length (base sequence length, source, target)
+        n, i, j - sequence length
         d - feature dimension
         """
 
@@ -122,29 +122,24 @@ class Attend(nn.Module):
 
         kv_einsum_eq = "b j d" if k.ndim == 3 else "b h j d"
 
-        # similarity
-
+        # Similarity
         sim = einsum(f"b h i d, {kv_einsum_eq} -> b h i j", q, k) * scale
 
-        # key padding mask
-
+        # Key Padding Mask
         if exists(mask):
             mask = rearrange(mask, "b j -> b 1 1 j")
             sim = sim.masked_fill(~mask, -torch.finfo(sim.dtype).max)
 
-        # causal mask
-
+        # Causal Mask
         if self.causal:
             causal_mask = self.get_mask(n, device)
             sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
 
-        # attention
-
+        # Attention
         attn = sim.softmax(dim=-1)
         attn = self.attn_dropout(attn)
 
-        # aggregate values
-
+        # Aggregate Values
         out = einsum(f"b h i j, {kv_einsum_eq} -> b h i d", attn, v)
 
         return out
