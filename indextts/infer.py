@@ -186,6 +186,7 @@ class IndexTTS:
         self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", is_fp16=True, device=None, use_cuda_kernel=None,
         speaker_info_path=None,  # 多說話人配置檔
         precision_config=None,   # 混合精度詳細配置
+        gpt_path=None,           # 強制指定 GPT 模型路徑
     ):
         # 裝置初始化
         if device is not None:
@@ -305,7 +306,13 @@ class IndexTTS:
         self.dtype = self.gpt_dtype if self.gpt_dtype != torch.float32 else None
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
 
-        self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
+        if gpt_path is not None:
+            if os.path.isabs(gpt_path):
+                self.gpt_path = gpt_path
+            else:
+                self.gpt_path = os.path.join(self.model_dir, gpt_path)
+        else:
+            self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
 
         # 載入 GPT 模型
         if self.use_quantization:
@@ -835,7 +842,8 @@ class IndexTTS:
                         num_return_sequences=1,
                         length_penalty=length_penalty,
                         num_beams=num_beams,
-                        repetition_penalty=repetition_penalty
+                        repetition_penalty=repetition_penalty,
+                        max_generate_length=max_mel_tokens
                     )
                 gpt_gen_time += time.perf_counter() - m_start_time
                 
@@ -843,7 +851,12 @@ class IndexTTS:
                     warnings.warn(f"警告: 生成長度超過限制 ({max_mel_tokens})，建議調整分句長度。", category=RuntimeWarning)
                     has_warned = True
 
+                # 診斷日誌：檢查生成的 mel codes
+                print(f">> [診斷] codes shape: {codes.shape}, stop_token 位置: {(codes == self.stop_mel_token).nonzero()[:5].tolist()}")
+                print(f">> [診斷] codes 前 20 個: {codes[0, :20].tolist()}")
+
                 codes, code_lens = self.remove_long_silence(codes)
+                print(f">> [診斷] 移除靜音後 code_lens: {code_lens.tolist()}")
                 
                 self._set_gr_progress(0.2 + 0.4 * progress / len(sentences), f"合成語音... {progress}/{len(sentences)}")
                 m_start_time = time.perf_counter()

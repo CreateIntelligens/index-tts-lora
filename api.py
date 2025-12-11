@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 from typing import Optional
+from contextlib import asynccontextmanager
 
 import torch
 import uvicorn
@@ -22,15 +23,6 @@ sys.path.append(os.path.join(current_dir, "indextts"))
 
 from indextts.infer import IndexTTS
 
-# 初始化 FastAPI
-app = FastAPI(
-    title="IndexTTS API",
-    description="Index-TTS 的高效能語音合成 API 服務",
-    version="1.0.0"
-)
-
-# 掛載靜態檔案
-app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # 全域變數
 tts: Optional[IndexTTS] = None
@@ -70,17 +62,30 @@ def initialize_tts():
             model_dir=model_dir,
             cfg_path=config_path,
             device=device,
-            is_fp16=use_fp16
+            is_fp16=use_fp16,
+            gpt_path=os.path.abspath("finetune_models/gpt_1211_epoch_9.pth")
         )
         print(">> [系統] TTS 引擎初始化完成")
     except Exception as e:
         print(f">> [錯誤] 初始化失敗: {e}")
         raise e
 
-@app.on_event("startup")
-async def startup_event():
-    """伺服器啟動時執行"""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """伺服器啟動與關閉時的生命週期管理"""
     initialize_tts()
+    yield
+
+# 初始化 FastAPI
+app = FastAPI(
+    title="IndexTTS API",
+    description="Index-TTS 的高效能語音合成 API 服務",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# 掛載靜態檔案
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/")
 async def read_index():
@@ -171,7 +176,7 @@ async def text_to_speech(
     text: str = Form(...),
     prompt_audio: UploadFile = File(None),
     prompt_audio_path: str = Form(None),
-    infer_mode: str = Form("fast"),
+    infer_mode: str = Form("normal"),
     speaker_id: str = Form(None),
     # 進階參數
     max_text_tokens_per_sentence: int = Form(120),
@@ -179,8 +184,10 @@ async def text_to_speech(
     do_sample: bool = Form(True),
     top_p: float = Form(0.8),
     top_k: int = Form(30),
-    temperature: float = Form(1.0),
-    repetition_penalty: float = Form(10.0)
+    temperature: float = Form(0.3),
+    repetition_penalty: float = Form(10.0),
+    length_penalty: float = Form(0.0),
+    max_mel_tokens: int = Form(600)
 ):
     """
     執行語音合成。
@@ -225,9 +232,9 @@ async def text_to_speech(
             "top_k": top_k if top_k > 0 else None,
             "temperature": temperature,
             "repetition_penalty": repetition_penalty,
-            "length_penalty": 0.0,
+            "length_penalty": length_penalty,
             "num_beams": 3,
-            "max_mel_tokens": 600
+            "max_mel_tokens": max_mel_tokens
         }
 
         if infer_mode == "fast":

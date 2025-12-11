@@ -9,10 +9,74 @@ import numpy as np
 import torch
 from loguru import logger
 from omegaconf import DictConfig, OmegaConf
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 # 匯入與 infer.py 相同的文字處理類別
 from indextts.utils.front import TextNormalizer, TextTokenizer
+
+
+class WeightedDistributedSampler(DistributedSampler):
+    """
+    結合 DistributedSampler 與 WeightedRandomSampler 的功能。
+
+    用於 DDP 訓練時進行加權取樣，使得不同樣本以不同機率被選中，
+    同時保證各個 GPU 之間的資料分割。
+
+    Args:
+        dataset: 資料集實例
+        weights: 每個樣本的權重 (numpy array 或 list)
+        num_replicas: 總 GPU 數量（預設自動偵測）
+        rank: 當前 GPU 的排序（預設自動偵測）
+        shuffle: 是否在 epoch 之間打亂順序
+        seed: 隨機種子
+        replacement: 是否有放回取樣（建議 True 以保持權重意義）
+    """
+    def __init__(
+        self,
+        dataset,
+        weights,
+        num_replicas=None,
+        rank=None,
+        shuffle=True,
+        seed=0,
+        replacement=True
+    ):
+        super().__init__(dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle, seed=seed)
+
+        if isinstance(weights, list):
+            weights = np.array(weights, dtype=np.float32)
+
+        self.weights = torch.as_tensor(weights, dtype=torch.double)
+        self.replacement = replacement
+
+        # 每個 GPU 處理的樣本數
+        self.num_samples = int(np.ceil(len(self.dataset) / self.num_replicas))
+        self.total_size = self.num_samples * self.num_replicas
+
+    def __iter__(self):
+        """產生加權取樣的索引"""
+        if self.shuffle:
+            # 根據 epoch 設定隨機種子以確保可重現性
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+
+            # 使用權重進行取樣
+            indices = torch.multinomial(
+                self.weights,
+                self.total_size,
+                replacement=self.replacement,
+                generator=g
+            ).tolist()
+        else:
+            # 不打亂時，重複索引以填滿 total_size
+            indices = list(range(len(self.dataset)))
+            indices += indices[:(self.total_size - len(indices))]
+
+        # 分配給當前 GPU 的部分
+        indices = indices[self.rank:self.total_size:self.num_replicas]
+        assert len(indices) == self.num_samples
+
+        return iter(indices)
 
 
 def _load_manifest_batch(batch):
@@ -31,6 +95,16 @@ def _load_manifest_batch(batch):
                         if duration > 20 or duration < 1:
                             total_filtered += 1
                             continue
+
+                        # 文字長度過濾
+                        text_len = len(item.get("text", ""))
+                        if self.min_text_length > 0 and text_len < self.min_text_length:
+                            total_filtered += 1
+                            continue
+                        if self.max_text_length > 0 and text_len > self.max_text_length:
+                            total_filtered += 1
+                            continue
+
                         item['speaker_id'] = speaker_id
                         all_items.append(item)
         except Exception as e:
@@ -66,6 +140,22 @@ class FinetuneDataset(Dataset):
         self.cross_speaker_ratio = 0.0
         if hasattr(config, "train") and isinstance(config.train, DictConfig):
             self.cross_speaker_ratio = float(config.train.get("cross_speaker_ratio", 0.0))
+
+        # 文字長度過濾
+        self.min_text_length = 0
+        self.max_text_length = 0
+        if hasattr(config, "train") and isinstance(config.train, DictConfig):
+            self.min_text_length = int(config.train.get("min_text_length", 0))
+            self.max_text_length = int(config.train.get("max_text_length", 0))
+
+        # 文字長度加權取樣
+        self.text_length_weights = {}
+        if hasattr(config, "train") and isinstance(config.train, DictConfig):
+            weights_cfg = config.train.get("text_length_weights", None)
+            if weights_cfg and isinstance(weights_cfg, dict):
+                self.text_length_weights = {int(k): float(v) for k, v in weights_cfg.items()}
+
+        self.sample_weights = None  # 將在載入資料後計算
 
         # 推斷 data_path (用於尋找 index 檔案)
         if manifest_files:
@@ -104,6 +194,10 @@ class FinetuneDataset(Dataset):
             (f"，已過濾掉 {filtered_count} 個不符合時長的樣本" if filtered_count > 0 else "")
         )
 
+        # 計算文字長度加權取樣權重
+        if self.text_length_weights and rank == 0:
+            self._compute_sample_weights()
+
         # Metadata 載入完成後，才初始化 Tokenizer (僅載入一次)
         print(">> [系統] 初始化 TextNormalizer 與 BPE Tokenizer...")
         self.normalizer = TextNormalizer()
@@ -113,6 +207,73 @@ class FinetuneDataset(Dataset):
 
     def __len__(self):
         return len(self.index) if self.use_lazy_metadata else len(self.data)
+
+    def _compute_sample_weights(self):
+        """根據文字長度計算取樣權重"""
+        import numpy as np
+
+        num_samples = len(self)
+        weights = np.ones(num_samples, dtype=np.float32)
+
+        # 根據文字長度分配權重
+        sorted_thresholds = sorted(self.text_length_weights.keys())
+
+        for idx in range(num_samples):
+            if self.use_lazy_metadata:
+                manifest_idx, offset = self.index[idx]
+                manifest_file = self.manifest_files[manifest_idx]
+                try:
+                    item = self._read_item(manifest_file, offset)
+                    text_len = len(item.get("text", ""))
+                except:
+                    continue
+            else:
+                text_len = len(self.data[idx].get("text", ""))
+
+            # 根據長度分配權重
+            weight = 1.0
+            for threshold in sorted_thresholds:
+                if text_len <= threshold:
+                    weight = self.text_length_weights[threshold]
+                    break
+
+            weights[idx] = weight
+
+        self.sample_weights = weights
+        logger.info(f"✓ 已計算加權取樣權重 (平均權重: {weights.mean():.3f})")
+
+    def get_sampler(self, shuffle=True, num_replicas=None, rank=None):
+        """
+        回傳加權取樣器（如果有設定權重）。
+
+        Args:
+            shuffle: 是否打亂順序
+            num_replicas: DDP 的總 GPU 數（None 表示單卡模式）
+            rank: DDP 的當前 GPU 排序（None 表示單卡模式）
+
+        Returns:
+            Sampler 實例，若未設定權重則回傳 None
+        """
+        if self.sample_weights is not None:
+            if num_replicas is not None:
+                # DDP 模式：使用 WeightedDistributedSampler
+                return WeightedDistributedSampler(
+                    dataset=self,
+                    weights=self.sample_weights,
+                    num_replicas=num_replicas,
+                    rank=rank,
+                    shuffle=shuffle,
+                    replacement=True
+                )
+            else:
+                # 單卡模式：使用 WeightedRandomSampler
+                from torch.utils.data import WeightedRandomSampler
+                return WeightedRandomSampler(
+                    weights=self.sample_weights,
+                    num_samples=len(self),
+                    replacement=True
+                )
+        return None
 
     def __getitem__(self, index):
         if self.use_lazy_metadata:
@@ -183,6 +344,14 @@ class FinetuneDataset(Dataset):
         duration = item.get("duration", 0)
         if duration > 20 or duration < 1:
             raise ValueError(f"[錯誤] 時長 {duration} 超出範圍 [1, 20]")
+
+        # 文字長度過濾
+        text_len = len(item.get("text", ""))
+        if self.min_text_length > 0 and text_len < self.min_text_length:
+            raise ValueError(f"[錯誤] 文字長度 {text_len} < min_text_length {self.min_text_length}")
+        if self.max_text_length > 0 and text_len > self.max_text_length:
+            raise ValueError(f"[錯誤] 文字長度 {text_len} > max_text_length {self.max_text_length}")
+
         return item
 
     def _sample_condition_lazy(self, manifest_idx: int, target_offset: int):
@@ -454,6 +623,16 @@ class FinetuneDataset(Dataset):
                             if duration > 20 or duration < 1:
                                 filtered += 1
                                 continue
+
+                            # 文字長度過濾
+                            text_len = len(item.get("text", ""))
+                            if self.min_text_length > 0 and text_len < self.min_text_length:
+                                filtered += 1
+                                continue
+                            if self.max_text_length > 0 and text_len > self.max_text_length:
+                                filtered += 1
+                                continue
+
                             item['speaker_id'] = self._infer_speaker_id(item.get("audio", ""))
                             items.append(item)
             except Exception as e:

@@ -548,17 +548,23 @@ class Trainer:
         model.inference_model = get_peft_model(model.inference_model, gpt_lora_config)
 
         # ⚠️ 重要：凍結 conditioning_encoder 和 perceiver_encoder
-        # 原因：預訓練的 encoder 已經學會抽取音色，如果繼續訓練，
-        # 它會學習編碼更多資訊（包括內容），導致推論時複製參考音檔的文字內容。
-        # 這是 zero-shot TTS 的常見問題。
+        #
+        # 策略說明：
+        # - conditioning_encoder: 凍結（防止編碼內容資訊，保留預訓練的音色提取能力）
+        # - perceiver_encoder: 凍結（保留預訓練的 embedding space，防止被覆寫）
+        # - GPT LoRA: 訓練（學習如何使用 conditioning）
+        #
+        # 理由：
+        # 1. 預訓練的 encoder 已具備通用音色提取能力
+        # 2. 訓練 perceiver 會破壞原本的 embedding space，導致 clone 能力崩潰
+        # 3. 僅訓練 LoRA 層，讓模型學習如何使用固定的 conditioning 來生成語音
         if hasattr(model, "conditioning_encoder"):
             model.conditioning_encoder.requires_grad_(False)
             logger.info("✓ conditioning_encoder 已凍結（防止內容洩漏）")
         if hasattr(model, "perceiver_encoder"):
             model.perceiver_encoder.requires_grad_(False)
-            logger.info("✓ perceiver_encoder 已凍結（防止內容洩漏）")
+            logger.info("✓ perceiver_encoder 已凍結（保留 embedding space）")
 
-        # 只訓練 LoRA 層，讓 GPT 學習如何根據「固定的音色 embedding」生成對應內容
         return model
 
     def _setup_optimizer_and_scheduler(self, num_training_steps: int = 1000):
@@ -706,15 +712,70 @@ class Trainer:
         
         return avg_text_loss, avg_mel_loss, acc_1, acc_10, acc_20
 
-    def _save_checkpoint(self, file_name: str, merge_lora: bool, unload_after_merge: bool):
+    def _load_checkpoint_states(self, checkpoint_path: str) -> int:
+        """
+        從 checkpoint 恢復訓練
+
+        Args:
+            checkpoint_path: checkpoint 檔案路徑 (.pt)
+
+        Returns:
+            start_epoch: 要從哪個 epoch 開始繼續訓練
+        """
+        if not os.path.exists(checkpoint_path):
+            logger.error(f"❌ 找不到檢查點: {checkpoint_path}")
+            return 0
+
+        logger.info(f"📂 正在載入檢查點: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+        # 載入模型權重
+        cleaned_state = normalize_state_dict_keys(checkpoint['model_state_dict'])
+        actual_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        actual_model.load_state_dict(cleaned_state)
+        logger.info("✓ 模型權重已載入")
+
+        # 載入 optimizer 和 scheduler
+        if hasattr(self, 'optimizer') and self.optimizer is not None:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            logger.info("✓ 優化器狀態已載入")
+
+        if hasattr(self, 'scheduler') and self.scheduler is not None:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            logger.info("✓ 排程器狀態已載入")
+
+        start_epoch = checkpoint['epoch'] + 1
+        logger.info(f"✓ 恢復訓練自 Epoch {start_epoch}")
+        
+        return start_epoch
+
+    def _save_checkpoint(self, file_name: str, merge_lora: bool, unload_after_merge: bool, extra_state: dict = None):
         """
         儲存模型檢查點。
 
         Args:
-            file_name (str): 檔案名稱。
+            file_name (str): 推理模型檔案名稱 (.pth)。
             merge_lora (bool): 是否將 LoRA 權重合併進主模型。
-            unload_after_merge (bool): 合併後是否卸載 LoRA (若為 True 則不影響訓練中的模型實例)。
+            unload_after_merge (bool): 合併後是否卸載 LoRA。
+            extra_state (dict): 如果不為 None，則額外儲存一個包含訓練狀態的 .pt 檔。
         """
+        # 1. 儲存訓練狀態 (Resume Checkpoint)
+        if extra_state is not None:
+            train_ckpt_path = os.path.join(self.checkpoint_dir, f"checkpoint_epoch_{extra_state['epoch'] + 1}.pt")
+            actual_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+            
+            save_dict = {
+                'epoch': extra_state['epoch'],
+                'model_state_dict': actual_model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict() if self.optimizer else None,
+                'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
+                'val_text_loss': extra_state.get('val_text_loss'),
+                'val_mel_loss': extra_state.get('val_mel_loss'),
+            }
+            torch.save(save_dict, train_ckpt_path)
+            logger.info(f"💾 訓練狀態檢查點已儲存: {train_ckpt_path}")
+
+        # 2. 儲存推理模型 (Inference Model)
         checkpoint_path = os.path.join(self.checkpoint_dir, file_name)
         self.model.eval()
 
@@ -733,11 +794,26 @@ class Trainer:
             else:
                 actual_model.inference_model.merge_adapter()
     
+        # 取得 state_dict，但排除 inference_model.* (避免重複儲存 gpt 參數)
+        # inference_model 是 gpt 的 wrapper，會在載入時重新建立
+        # 儲存前可選擇降精度以減少檔案大小（預設 fp16 與底模一致）
+        save_dtype = self.config.train.get("save_dtype", "fp16")
+        if save_dtype == "fp16":
+            model_to_save = model_to_save.half()
+            logger.info("💾 Saving merged model in FP16")
+        elif save_dtype == "bf16":
+            model_to_save = model_to_save.bfloat16()
+            logger.info("💾 Saving merged model in BF16")
+        else:
+            logger.info("💾 Saving merged model in FP32")
+
         state_dict = model_to_save.state_dict()
-        checkpoint_data = {'model': state_dict}
-        
+        filtered_state_dict = {k: v for k, v in state_dict.items() if not k.startswith('inference_model')}
+
+        checkpoint_data = {'model': filtered_state_dict}
+
         torch.save(checkpoint_data, checkpoint_path)
-        logger.info(f"檢查點已儲存至: {checkpoint_path}")
+        logger.info(f"推理模型已儲存至: {checkpoint_path}")
     
         if merge_lora and unload_after_merge:
             del model_to_save
@@ -750,13 +826,14 @@ class Trainer:
 
         self.model.train()
 
-    def train(self, train_ds: Dataset, valid_ds: Dataset):
+    def train(self, train_ds: Dataset, valid_ds: Dataset, resume_checkpoint: str = None):
         """
         執行主要訓練迴圈。
 
         Args:
             train_ds (Dataset): 訓練資料集。
             valid_ds (Dataset): 驗證資料集。
+            resume_checkpoint (str): 檢查點路徑，用於接續訓練。
         """
         train_cfg = self.config.train
         total_ds_count = len(train_ds)
@@ -765,13 +842,25 @@ class Trainer:
         total_update_steps = samples_per_epoch * train_cfg.epochs
         self._setup_optimizer_and_scheduler(num_training_steps=total_update_steps)
         
-        logger.info(f"開始訓練，共 {train_cfg.epochs} 輪 (Epochs)。")
+        start_epoch = 0
+        if resume_checkpoint:
+            start_epoch = self._load_checkpoint_states(resume_checkpoint)
+            if start_epoch > 0:
+                # 重新計算 update_steps 以便 TensorBoard 接續
+                self.update_steps = start_epoch * samples_per_epoch
+                logger.info(f"已更新 global step 為 {self.update_steps}")
+
+        if start_epoch >= train_cfg.epochs:
+            logger.info(f"訓練已完成 (Current Epoch: {start_epoch}, Max Epochs: {train_cfg.epochs})。")
+            return
+
+        logger.info(f"開始訓練，共 {train_cfg.epochs} 輪 (Epochs)，從第 {start_epoch + 1} 輪開始。")
         logger.info(f"每輪樣本數: {samples_per_epoch}")
         logger.info(f"總更新步數: {total_update_steps}")
 
         text_weight = train_cfg.text_weight
 
-        for epoch in range(train_cfg.epochs):
+        for epoch in range(start_epoch, train_cfg.epochs):
             logger.info(f"EPOCH {epoch + 1}/{train_cfg.epochs} 開始 " + "=" * 30)
 
             # 使用 tqdm 包裝訓練資料載入器，實現進度條顯示
@@ -839,9 +928,15 @@ class Trainer:
             self.writer.add_scalar("val/accuracy_top10", val_acc10, epoch + 1)
             self.writer.add_scalar("val/accuracy_top20", val_acc20, epoch + 1)
 
+            extra_state = {
+                'epoch': epoch,
+                'val_text_loss': val_text_loss,
+                'val_mel_loss': val_mel_loss
+            }
+
             epoch_checkpoint_name = f"gpt_epoch_{epoch + 1}.pth"
             logger.info(f"儲存 Epoch {epoch + 1} 模型: {epoch_checkpoint_name}")
-            self._save_checkpoint(epoch_checkpoint_name, merge_lora=True, unload_after_merge=True)
+            self._save_checkpoint(epoch_checkpoint_name, merge_lora=True, unload_after_merge=True, extra_state=extra_state)
             
             if val_mel_loss < self.best_val_loss[2]:
                 logger.info(f"發現最佳驗證 Mel Loss: {val_mel_loss:.4f}。儲存最佳模型。")
@@ -866,6 +961,11 @@ class Trainer:
         self.writer.close()
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='IndexTTS LoRA Training')
+    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint (.pt) to resume from')
+    args = parser.parse_args()
+
     config_path = "finetune_models/config.yaml"
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"找不到配置檔案: {config_path}")
@@ -873,15 +973,36 @@ def main():
     config = OmegaConf.load(config_path)
     bpe_model_path = os.path.join(config.train.finetune_model_dir, config.dataset.bpe_model)
 
-    train_ds, valid_ds = load_finetune_datasets(config, bpe_model_path) 
-    train_ds = DataLoader(train_ds, batch_size=16, shuffle=True, collate_fn=collate_finetune_fn, num_workers=4)
-    valid_ds = DataLoader(valid_ds, batch_size=8, shuffle=False, collate_fn=collate_finetune_fn, num_workers=2)
+    train_dataset, valid_dataset = load_finetune_datasets(config, bpe_model_path)
+
+    # 嘗試取得加權取樣器
+    train_sampler = None
+    if hasattr(train_dataset, 'get_sampler'):
+        train_sampler = train_dataset.get_sampler(shuffle=True)
+        if train_sampler is not None:
+            logger.info("✓ 使用加權取樣策略 (Weighted Sampling)")
+
+    # 建立 DataLoader
+    train_ds = DataLoader(
+        train_dataset,
+        batch_size=16,
+        sampler=train_sampler,
+        shuffle=(train_sampler is None),  # 有 sampler 時不能用 shuffle
+        collate_fn=collate_finetune_fn,
+        num_workers=4
+    )
+    valid_ds = DataLoader(
+        valid_dataset,
+        batch_size=8,
+        shuffle=False,
+        collate_fn=collate_finetune_fn,
+        num_workers=2
+    )
 
     trainer = Trainer(config)
-    trainer.train(train_ds, valid_ds)
+    trainer.train(train_ds, valid_ds, resume_checkpoint=args.resume)
     logger.info("UnifiedVoice 微調流程結束。")
 
 
 if __name__ == "__main__":
     main()
-

@@ -485,10 +485,12 @@ class UnifiedVoice(nn.Module):
             return first_logits
 
     def get_conditioning(self, speech_conditioning_input, cond_mel_lengths=None, speaker_ids=None):
-        if speaker_ids is not None:
+        # ⚠️ 重要：speaker_ids 僅在「無參考音檔」時才使用
+        # 有參考音檔時，應始終走 encoder 以實現 zero-shot clone
+        if speaker_ids is not None and speech_conditioning_input is None:
             batch_size = len(speaker_ids)
-            device = speech_conditioning_input.device if speech_conditioning_input is not None else next(self.parameters()).device
-            
+            device = next(self.parameters()).device
+
             conds_list = []
             for speaker_id in speaker_ids:
                 param_name = f'mean_condition_{speaker_id}'
@@ -503,12 +505,12 @@ class UnifiedVoice(nn.Module):
                     conds_list.append(speaker_condition)
                 else:
                     raise ValueError(f"找不到說話人 {speaker_id} 的條件向量")
-            
+
             return torch.cat(conds_list, dim=0)
-        
-        if hasattr(self, 'mean_condition') and self.mean_condition is not None:
-            batch_size = speech_conditioning_input.shape[0] if speech_conditioning_input is not None else 1
-            device = speech_conditioning_input.device if speech_conditioning_input is not None else next(self.parameters()).device
+
+        if hasattr(self, 'mean_condition') and self.mean_condition is not None and speech_conditioning_input is None:
+            batch_size = 1
+            device = next(self.parameters()).device
             if self.mean_condition.device != device:
                 logger.info(f"警告: mean_condition 裝置不符，移動至 {device}")
                 self.mean_condition = self.mean_condition.to(device)

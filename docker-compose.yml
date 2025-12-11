@@ -31,6 +31,7 @@ services:
     ports:
       - "7860:7860"  # webui
       - "7859:7859"  # api.py
+      - "8006:8006"  # tensorboard
       - "7859:7859"  # API Port
 
     # 掛載卷 - 掛載整個專案目錄

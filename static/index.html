@@ -49,6 +49,14 @@
             background: #475569; 
             border-radius: 3px;
         }
+        /* 自定義 Audio 播放器樣式 (簡易版) */
+        audio.custom-audio {
+            filter: invert(1) hue-rotate(180deg) saturate(0.5); 
+            border-radius: 0.5rem;
+        }
+        audio.custom-audio::-webkit-media-controls-panel {
+            background-color: #cbd5e1;
+        }
     </style>
 </head>
 <body class="bg-dark text-slate-200 h-screen overflow-hidden flex flex-col">
@@ -69,9 +77,14 @@
                     <label class="text-sm font-semibold text-slate-300 mb-2 block flex items-center gap-2">
                         <i class="ph ph-cpu"></i> 模型選擇
                     </label>
-                    <select v-model="selectedModel" @change="changeModel" class="w-full bg-dark border border-slate-600 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-primary transition-colors">
-                        <option v-for="m in models" :value="m.filename">{{ m.name }}</option>
-                    </select>
+                    <div class="flex items-center gap-2">
+                        <select v-model="selectedModel" @change="changeModel" class="flex-1 bg-dark border border-slate-600 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-primary transition-colors cursor-pointer">
+                            <option v-for="m in models" :value="m.filename">{{ m.name }}</option>
+                        </select>
+                        <button @click="refreshModelsList" title="重新整理模型列表" class="h-[38px] w-[38px] flex-shrink-0 bg-surface border border-slate-600 hover:border-primary hover:text-primary rounded-lg text-slate-400 transition-all flex items-center justify-center">
+                            <i class="ph ph-arrows-clockwise text-lg"></i>
+                        </button>
+                    </div>
                     <p class="text-xs text-slate-500 mt-2" v-if="loadingModel">
                         <i class="ph ph-spinner animate-spin"></i> 正在載入模型...
                     </p>
@@ -84,31 +97,46 @@
                     </label>
                     
                     <!-- 檔案上傳區 -->
-                    <div 
-                        class="border-2 border-dashed border-slate-600 rounded-lg p-4 text-center cursor-pointer hover:border-primary transition-colors relative"
+                    <div v-if="!promptFile && !serverPromptPath"
+                        class="border-2 border-dashed border-slate-600 rounded-lg p-4 text-center cursor-pointer hover:border-primary transition-colors relative group"
                         @click="$refs.fileInput.click()"
                         @dragover.prevent
                         @drop.prevent="handleDrop"
                     >
                         <input type="file" ref="fileInput" @change="handleFileSelect" class="hidden" accept="audio/*">
-                        <div v-if="!promptFile" class="text-slate-400">
+                        <div class="text-slate-400 group-hover:text-primary transition-colors">
                             <i class="ph ph-upload-simple text-2xl mb-1"></i>
                             <p class="text-xs">點擊或拖放音訊檔案</p>
                         </div>
-                        <div v-else class="text-primary flex items-center justify-center gap-2">
-                            <i class="ph ph-file-audio text-xl"></i>
-                            <span class="text-sm truncate max-w-[150px]">{{ promptFile.name }}</span>
-                            <button @click.stop="promptFile = null" class="text-slate-400 hover:text-red-400">
+                    </div>
+
+                    <!-- 已選擇音訊預覽區 -->
+                    <div v-else class="bg-dark border border-slate-600 rounded-lg p-3">
+                        <div class="flex justify-between items-center mb-2">
+                            <div class="flex items-center gap-2 overflow-hidden">
+                                <i class="ph ph-file-audio text-primary"></i>
+                                <span class="text-xs text-slate-300 truncate">{{ promptFile ? promptFile.name : serverPromptPath }}</span>
+                            </div>
+                            <button @click="clearPrompt" class="text-slate-500 hover:text-red-400 transition-colors p-1">
                                 <i class="ph ph-x"></i>
                             </button>
                         </div>
+                        
+                        <!-- 預覽播放器 -->
+                        <audio ref="previewPlayer" controls class="w-full h-8 block custom-audio" v-if="previewUrl">
+                            <source :src="previewUrl" type="audio/wav">
+                        </audio>
+                        <p v-else class="text-xs text-slate-500 italic text-center">
+                            (伺服器檔案暫不支援預覽)
+                        </p>
                     </div>
                     
                     <!-- 預設範例 -->
-                    <div class="mt-3">
+                    <div class="mt-3" v-if="!promptFile">
                         <p class="text-xs text-slate-500 mb-1">或使用伺服器範例:</p>
-                        <select v-model="serverPromptPath" class="w-full bg-dark border border-slate-600 rounded-lg px-2 py-1 text-xs text-slate-400">
-                            <option value="">-- 使用上傳檔案 --</option>
+                        <select v-model="serverPromptPath" class="w-full bg-dark border border-slate-600 rounded-lg px-2 py-1 text-xs text-slate-400 focus:border-primary focus:outline-none">
+                            <!-- <option value="">-- 選擇範例檔案 --</option> -->
+                            <option value="tests/Hayley.wav">Hayley</option>
                             <option value="tests/sample_prompt.wav">tests/sample_prompt.wav</option>
                         </select>
                     </div>
@@ -185,28 +213,20 @@
             <!-- 底部區：播放器與歷史 -->
             <div class="h-80 bg-surface border-t border-slate-700 shadow-[0_-4px_20px_rgba(0,0,0,0.3)] z-10 flex flex-col">
                 <!-- 波形顯示 -->
-                <div class="h-24 bg-dark/50 relative group">
-                    <div id="waveform" class="w-full h-full"></div>
+                <div class="h-24 bg-dark/50 relative group cursor-pointer" @click="togglePlay">
+                    <div id="waveform" class="w-full h-full pointer-events-none"></div>
+                    
                     <div class="absolute inset-0 flex items-center justify-center pointer-events-none" v-if="!currentAudioUrl">
                         <p class="text-slate-600 text-sm">等待生成音訊...</p>
                     </div>
-                    <!-- 播放控制覆蓋層：改為常駐顯示，生成後立刻可見 -->
-                    <div v-if="currentAudioUrl" class="absolute inset-0 bg-black/0 group-hover:bg-black/10 transition-colors flex items-center justify-center pointer-events-none">
-                        <button class="bg-white/20 backdrop-blur rounded-full p-3 pointer-events-auto hover:bg-white/30 transition" @click="togglePlay">
-                            <i :class="isPlaying ? 'ph-pause-fill' : 'ph-play-fill'" class="ph text-white text-2xl"></i>
+                    
+                    <!-- 播放控制覆蓋層 (常駐顯示，但播放時變透明) -->
+                    <div v-if="currentAudioUrl" 
+                         class="absolute inset-0 flex items-center justify-center transition-opacity duration-300"
+                         :class="isPlaying ? 'opacity-0 group-hover:opacity-100' : 'opacity-100 bg-black/20'">
+                        <button class="bg-white/10 backdrop-blur-sm rounded-full p-4 hover:bg-white/20 hover:scale-110 transition-all transform shadow-lg border border-white/10">
+                            <i :class="isPlaying ? 'ph-pause-fill' : 'ph-play-fill'" class="ph text-white text-3xl"></i>
                         </button>
-                    </div>
-                </div>
-
-                <!-- 播放控制列（常駐；移到波形下方，不遮蓋內容） -->
-                <div class="px-6 py-3 border-b border-slate-700 flex items-center gap-4 bg-surface">
-                    <button @click="togglePlay" :disabled="!currentAudioUrl"
-                        class="bg-primary/80 hover:bg-primary text-white px-4 py-2 rounded-lg disabled:opacity-50 flex items-center gap-2 transition">
-                        <i :class="isPlaying ? 'ph-pause' : 'ph-play'" class="ph"></i>
-                        <span class="text-sm">{{ isPlaying ? '暫停' : '播放' }}</span>
-                    </button>
-                    <div class="text-xs text-slate-400" v-if="currentAudioUrl">
-                        <i class="ph ph-wave-sine mr-1"></i>已載入音訊，點擊播放
                     </div>
                 </div>
 
@@ -261,6 +281,7 @@
                 const loadingModel = ref(false);
                 const promptFile = ref(null);
                 const serverPromptPath = ref("");
+                const previewUrl = ref(null);
                 const currentAudioUrl = ref(null);
                 const isPlaying = ref(false);
                 const wavesurfer = ref(null);
@@ -268,14 +289,15 @@
 
                 // 參數設定
                 const params = ref({
-                    infer_mode: "fast",
+                    infer_mode: "normal",
                     max_text_tokens_per_sentence: 120,
                     sentences_bucket_max_size: 4,
                     do_sample: true,
                     top_p: 0.8,
                     top_k: 30,
-                    temperature: 1.0,
+                    temperature: 0.3,
                     repetition_penalty: 10.0,
+                    length_penalty: 0.0,
                     max_mel_tokens: 600,
                 });
 
@@ -284,7 +306,9 @@
                     top_p: { label: "Top-P", min: 0.0, max: 1.0, step: 0.01 },
                     top_k: { label: "Top-K", min: 0, max: 100, step: 1 },
                     repetition_penalty: { label: "Repetition Penalty", min: 0.1, max: 20.0, step: 0.1 },
+                    length_penalty: { label: "Length Penalty", min: -2.0, max: 2.0, step: 0.1 },
                     max_text_tokens_per_sentence: { label: "Max Tokens/Sentence", min: 20, max: 500, step: 10 },
+                    max_mel_tokens: { label: "Max Mel Tokens", min: 100, max: 1500, step: 50 },
                 };
 
                 onMounted(async () => {
@@ -341,21 +365,43 @@
 
                 const handleFileSelect = (e) => {
                     if (e.target.files.length > 0) {
-                        promptFile.value = e.target.files[0];
-                        serverPromptPath.value = ""; // 清除伺服器路徑選擇
+                        setPromptFile(e.target.files[0]);
                     }
                 };
 
                 const handleDrop = (e) => {
                     if (e.dataTransfer.files.length > 0) {
-                        promptFile.value = e.dataTransfer.files[0];
-                        serverPromptPath.value = "";
+                        setPromptFile(e.dataTransfer.files[0]);
                     }
+                };
+                
+                const setPromptFile = (file) => {
+                    promptFile.value = file;
+                    serverPromptPath.value = ""; // 清除伺服器路徑選擇
+                    if (previewUrl.value) URL.revokeObjectURL(previewUrl.value);
+                    previewUrl.value = URL.createObjectURL(file);
+                };
+                
+                const clearPrompt = () => {
+                    promptFile.value = null;
+                    serverPromptPath.value = "";
+                    if (previewUrl.value) {
+                        URL.revokeObjectURL(previewUrl.value);
+                        previewUrl.value = null;
+                    }
+                    // 重置 file input 以便下次能選同一個檔案
+                    // 注意：這裡無法直接訪問 $refs，需確保 fileInput 已綁定
                 };
 
                 // 當選擇伺服器範例時，清除上傳檔案
                 watch(serverPromptPath, (newVal) => {
-                    if (newVal) promptFile.value = null;
+                    if (newVal) {
+                        promptFile.value = null;
+                        if (previewUrl.value) {
+                            URL.revokeObjectURL(previewUrl.value);
+                            previewUrl.value = null;
+                        }
+                    }
                 });
 
                 const generate = async () => {
@@ -431,6 +477,11 @@
 
                 const clearText = () => inputText.value = "";
 
+                const refreshModelsList = async () => {
+                    await fetchModels();
+                    alert("模型列表已刷新！"); 
+                };
+
                 return {
                     inputText,
                     isGenerating,
@@ -439,6 +490,7 @@
                     loadingModel,
                     promptFile,
                     serverPromptPath,
+                    previewUrl,
                     params,
                     sliders,
                     currentAudioUrl,
@@ -447,10 +499,12 @@
                     changeModel,
                     handleFileSelect,
                     handleDrop,
+                    clearPrompt,
                     generate,
                     togglePlay,
                     playHistory,
-                    clearText
+                    clearText,
+                    refreshModelsList
                 };
             }
         }).mount('#app');

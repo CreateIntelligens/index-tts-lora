@@ -66,6 +66,8 @@ train_model() {
 
     local mode="auto"  # auto, ddp, dp
     local num_gpus=""
+    local resume_arg=""
+    local auto_resume=0
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -79,6 +81,13 @@ train_model() {
                 shift
                 num_gpus="$1"
                 ;;
+            --resume)
+                shift
+                resume_arg="--resume $1"
+                ;;
+            --auto-resume)
+                auto_resume=1
+                ;;
             *)
                 print_warning "未知參數: $1"
                 ;;
@@ -87,6 +96,31 @@ train_model() {
     done
 
     check_container
+
+    # 處理自動 Resume
+    if [ "$auto_resume" -eq 1 ] && [ -z "$resume_arg" ]; then
+        local search_dir="finetune_models/checkpoints"
+        if [ "$USE_DOCKER" -eq 1 ]; then
+            # Docker 模式下，路徑需注意。這裡假設 finetune_models 在宿主機當前目錄也有
+            # 最好是在容器內檢查，但這會變得很複雜。
+            # 簡單起見，我們先檢查宿主機目錄（因為通常是掛載的）
+            :
+        fi
+        
+        if [ -d "$search_dir" ]; then
+            # 尋找最新的 checkpoint_epoch_*.pt
+            local latest_ckpt=$(ls -t "$search_dir"/checkpoint_epoch_*.pt 2>/dev/null | head -n 1)
+            
+            if [ -n "$latest_ckpt" ]; then
+                print_info "🔄 自動偵測到最新 Checkpoint: $latest_ckpt"
+                resume_arg="--resume $latest_ckpt"
+            else
+                print_warning "⚠️  在 $search_dir 找不到可用的 Checkpoint (.pt)，將從頭開始訓練。"
+            fi
+        else
+             print_warning "⚠️  目錄 $search_dir 不存在，將從頭開始訓練。"
+        fi
+    fi
 
     # 建立 log 目錄
     RUN_NAME="train_$(date +%Y%m%d_%H%M%S)"
@@ -135,12 +169,12 @@ train_model() {
                 export RUN_LOG_DIR='/workspace/index-tts-lora/$LOG_DIR'
                 python3 -m torch.distributed.run \
                 --nproc_per_node=$num_gpus \
-                train_ddp.py 2>&1 | tee /workspace/index-tts-lora/$LOG_FILE | tee /proc/1/fd/1
+                train_ddp.py $resume_arg 2>&1 | tee /workspace/index-tts-lora/$LOG_FILE | tee /proc/1/fd/1
             " 2>&1 | tee "$LOG_FILE"
         else
             RUN_NAME="$RUN_NAME" RUN_LOG_DIR="$LOG_DIR" python3 -m torch.distributed.run \
                 --nproc_per_node="$num_gpus" \
-                train_ddp.py 2>&1 | tee "$LOG_FILE"
+                train_ddp.py $resume_arg 2>&1 | tee "$LOG_FILE"
         fi
     else
         print_info "使用 DataParallel 訓練"
@@ -149,10 +183,10 @@ train_model() {
             docker compose exec -T index-tts-lora bash -c "
                 export RUN_NAME='$RUN_NAME'
                 export RUN_LOG_DIR='/workspace/index-tts-lora/$LOG_DIR'
-                python3 train.py 2>&1 | tee /workspace/index-tts-lora/$LOG_FILE | tee /proc/1/fd/1
+                python3 train.py $resume_arg 2>&1 | tee /workspace/index-tts-lora/$LOG_FILE | tee /proc/1/fd/1
             " 2>&1 | tee "$LOG_FILE"
         else
-            RUN_NAME="$RUN_NAME" RUN_LOG_DIR="$LOG_DIR" python3 train.py 2>&1 | tee "$LOG_FILE"
+            RUN_NAME="$RUN_NAME" RUN_LOG_DIR="$LOG_DIR" python3 train.py $resume_arg 2>&1 | tee "$LOG_FILE"
         fi
     fi
 
@@ -185,16 +219,18 @@ show_usage() {
     echo "用法: $0 <command> [options]"
     echo ""
     echo "Commands:"
-    echo "  train [--ddp|--dp] [--gpus N]  開始訓練模型"
-    echo "  tensorboard [--port PORT]      啟動 TensorBoard"
-    echo "  tensorboard-stop               停止 TensorBoard"
+    echo "  train [--ddp|--dp] [--gpus N] [--resume PATH | --auto-resume]  開始訓練模型"
+    echo "  tensorboard [--port PORT]                                      啟動 TensorBoard"
+    echo "  tensorboard-stop                                               停止 TensorBoard"
     echo ""
     echo "Examples:"
-    echo "  $0 train                       自動選擇訓練模式"
-    echo "  $0 train --ddp --gpus 4        使用 4 個 GPU 進行 DDP 訓練"
-    echo "  $0 tensorboard                 啟動 TensorBoard (預設 port 7859)"
-    echo "  $0 tensorboard --port 8080     指定 port 啟動 TensorBoard"
-    echo "  $0 tensorboard-stop            停止 TensorBoard"
+    echo "  $0 train                                       自動選擇訓練模式"
+    echo "  $0 train --ddp --gpus 4                        使用 4 個 GPU 進行 DDP 訓練"
+    echo "  $0 train --auto-resume                         自動接續最新的訓練"
+    echo "  $0 train --resume checkpoints/ckpt_epoch_5.pt  指定 Checkpoint 接續訓練"
+    echo "  $0 tensorboard                                 啟動 TensorBoard (預設 port 7859)"
+    echo "  $0 tensorboard --port 8080                     指定 port 啟動 TensorBoard"
+    echo "  $0 tensorboard-stop                            停止 TensorBoard"
 }
 
 # 直接執行時調用

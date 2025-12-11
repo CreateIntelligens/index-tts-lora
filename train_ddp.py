@@ -212,9 +212,16 @@ class DDPTrainer:
         model.inference_model = get_peft_model(model.inference_model, gpt_lora_config)
 
         # ⚠️ 重要：凍結 conditioning_encoder 和 perceiver_encoder
-        # 原因：預訓練的 encoder 已經學會抽取音色，如果繼續訓練，
-        # 它會學習編碼更多資訊（包括內容），導致推論時複製參考音檔的文字內容。
-        # 這是 zero-shot TTS 的常見問題。
+        #
+        # 策略說明：
+        # - conditioning_encoder: 凍結（防止編碼內容資訊，保留預訓練的音色提取能力）
+        # - perceiver_encoder: 凍結（保留預訓練的 embedding space，防止被覆寫）
+        # - GPT LoRA: 訓練（學習如何使用 conditioning）
+        #
+        # 理由：
+        # 1. 預訓練的 encoder 已具備通用音色提取能力
+        # 2. 訓練 perceiver 會破壞原本的 embedding space，導致 clone 能力崩潰
+        # 3. 僅訓練 LoRA 層，讓模型學習如何使用固定的 conditioning 來生成語音
         if hasattr(model, 'conditioning_encoder'):
             model.conditioning_encoder.requires_grad_(False)
             if self.is_main_process:
@@ -222,9 +229,8 @@ class DDPTrainer:
         if hasattr(model, 'perceiver_encoder'):
             model.perceiver_encoder.requires_grad_(False)
             if self.is_main_process:
-                logger.info("✓ perceiver_encoder 已凍結（防止內容洩漏）")
+                logger.info("✓ perceiver_encoder 已凍結（保留 embedding space）")
 
-        # 只訓練 LoRA 層，讓 GPT 學習如何根據「固定的音色 embedding」生成對應內容
         return model
 
     def _setup_optimizer_and_scheduler(self, num_training_steps: int = 0):
@@ -258,13 +264,26 @@ class DDPTrainer:
         train_cfg = self.config.train
         start_epoch = 0
 
-        # 使用 DistributedSampler
-        train_sampler = DistributedSampler(
-            train_ds,
-            num_replicas=self.world_size,
-            rank=self.rank,
-            shuffle=True
-        )
+        # 嘗試取得加權取樣器（若資料集有實作）
+        if hasattr(train_ds, 'get_sampler'):
+            train_sampler = train_ds.get_sampler(
+                shuffle=True,
+                num_replicas=self.world_size,
+                rank=self.rank
+            )
+        else:
+            train_sampler = None
+
+        # 若沒有加權取樣器，使用標準 DistributedSampler
+        if train_sampler is None:
+            train_sampler = DistributedSampler(
+                train_ds,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=True
+            )
+        elif self.is_main_process:
+            logger.info("✓ 使用加權取樣策略 (Weighted Sampling)")
 
         train_batch_size = train_cfg.get("batch_size", 1)
         train_num_workers = train_cfg.get("num_workers", 2)
@@ -301,10 +320,14 @@ class DDPTrainer:
             loaded_epoch = self._load_checkpoint_states(resume_checkpoint)
             if loaded_epoch > 0:
                 start_epoch = loaded_epoch
+                # 更新 update_steps
+                self.update_steps = start_epoch * steps_per_epoch
+                
                 # 重新計算剩餘步數並更新 scheduler
                 remaining_epochs = train_cfg.epochs - start_epoch
                 remaining_steps = steps_per_epoch * remaining_epochs
                 if self.is_main_process:
+                    logger.info(f"Updated global step to {self.update_steps}")
                     logger.info(f"Remaining training steps: {remaining_steps}")
 
         if self.is_main_process:
@@ -547,9 +570,22 @@ class DDPTrainer:
         model_to_save.inference_model = fused_inference_model
         logger.info("✓ LoRA weights merged and unloaded")
 
+        # 選擇儲存精度（預設 fp16，與底模一致，體積較小）
+        save_dtype = self.config.train.get("save_dtype", "fp16")
+        if save_dtype == "fp16":
+            model_to_save = model_to_save.half()
+            logger.info("💾 Saving merged model in FP16")
+        elif save_dtype == "bf16":
+            model_to_save = model_to_save.bfloat16()
+            logger.info("💾 Saving merged model in BF16")
+        else:
+            logger.info("💾 Saving merged model in FP32")
+
         # 儲存完整模型（格式與 train.py 一致）
+        # 排除 inference_model.* 避免重複儲存 gpt 參數
         state_dict = model_to_save.state_dict()
-        checkpoint_data = {'model': state_dict}
+        filtered_state_dict = {k: v for k, v in state_dict.items() if not k.startswith('inference_model')}
+        checkpoint_data = {'model': filtered_state_dict}
 
         torch.save(checkpoint_data, merged_model_path)
         logger.info(f"💾 Merged model saved: {merged_model_path}")
