@@ -148,13 +148,13 @@ bigvgan:
 train:
     finetune_model_dir: "finetune_models" # 微調模型輸出根目錄
     seed: 91
-    epochs: 2
+    epochs: 15
 
     # === GPU 資源優化配置 ===
     # 注意：啟用動態條件 (Dynamic Conditioning) 會增加 Mel 頻譜輸入，
     # 導致視訊記憶體 (VRAM) 需求上升。建議適度降低批次大小以避免記憶體不足 (OOM)。
-    batch_size: 32              # 單一 GPU 的訓練批次大小
-    valid_batch_size: 64        # 單一 GPU 的驗證批次大小
+    batch_size: 128              # 單一 GPU 的訓練批次大小
+    valid_batch_size: 256        # 單一 GPU 的驗證批次大小
     num_workers: 0              # 設定為 0 以避免 DDP 模式下的死鎖問題 (Deadlock)
     valid_num_workers: 0        # 設定為 0 以避免 DDP 模式下的死鎖問題
     prefetch_factor: null       # 當 num_workers=0 時必須設為 null
@@ -174,7 +174,28 @@ train:
     #   - 0.2  : 20% 機率 (較強的約束)
     #
     # 注意: 比例過高可能影響收斂速度，建議從 0.15 開始測試。
-    cross_speaker_ratio: 0.15
+    cross_speaker_ratio: 0.0
+
+    # =========================================================================
+    # Classifier-Free Guidance (CFG) 配置
+    # =========================================================================
+    # 訓練時以一定機率將 conditioning 設為零向量，強迫模型學習
+    # 「有 conditioning」vs「無 conditioning」的差異。
+    # 推理時可用 cfg_scale 放大 conditioning 的影響。
+    #
+    # 原理:
+    #   - 訓練時 drop conditioning → 模型學會區分有/無 conditioning
+    #   - 推理時: logits = uncond + scale * (cond - uncond)
+    #   - 當 scale > 1.0 時，更強烈地依賴 conditioning
+    #
+    # 建議值:
+    #   - 0.0  : 停用 CFG
+    #   - 0.10 : 10% 機率 drop conditioning (保守)
+    #   - 0.15 : 15% 機率 drop conditioning (建議起始值)
+    #   - 0.20 : 20% 機率 drop conditioning (較強)
+    #
+    # 注意: CFG 與 cross_speaker 可以同時使用，但建議先單獨測試 CFG。
+    cfg_dropout_ratio: 0.15
 
     # =========================================================================
     # 文字長度過濾與加權 (暫時停用以驗證模型架構)
@@ -215,15 +236,15 @@ train:
     save_dtype: "bf16"       # 儲存模型精度 (選項: "fp32", "fp16", "bf16")
 
     optimizer:
-        learning_rate: 5.0e-5
+        learning_rate: 5.0e-6
         weight_decay: 0.01
         warmup_ratio: 0.1       # 預熱 (Warmup) 步數佔總步數的比例
         loraplus_lr_ratio: 2.0  # LoRA+ B 矩陣的學習率倍率
 
     lora:
-        r: 16
-        lora_alpha: 32
-        lora_dropout: 0.1
+        r: 4
+        lora_alpha: 8
+        lora_dropout: 0.2
         target_modules:
             - "attn.c_attn"
             - "attn.c_proj"
@@ -243,6 +264,11 @@ version: 1.5
 inference:
   gpt: "bf16"        # GPT 模型推理精度: bf16 | fp16 | fp32
   vocoder: "bf16"    # 聲碼器推理精度
+
+  # Classifier-Free Guidance 推理配置
+  # 需要先用 cfg_dropout_ratio > 0 訓練模型才有效
+  cfg_scale: 1.0     # Guidance scale (1.0 = 不使用 CFG, >1.0 = 增強 conditioning)
+                     # 建議範圍: 1.5 ~ 3.0
 
   quantization:      # 權重量化 (節省視訊記憶體)
     enabled: false

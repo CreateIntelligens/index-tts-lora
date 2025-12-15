@@ -21,7 +21,8 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
 sys.path.append(os.path.join(current_dir, "indextts"))
 
-from indextts.infer import IndexTTS
+import random # Added random import
+from indextts.infer import IndexTTS, set_seed # Added set_seed import
 
 
 # 全域變數
@@ -29,7 +30,7 @@ tts: Optional[IndexTTS] = None
 model_dir: str = "checkpoints"
 config_path: str = "checkpoints/config.yaml"
 device: str = "cuda:0" if torch.cuda.is_available() else "cpu"
-use_fp16: bool = True
+use_fp16: bool = True  # 注意：實際會自動選擇 BF16（如果GPU支持）或 FP16
 
 class TTSRequest(BaseModel):
     text: str
@@ -56,14 +57,15 @@ def initialize_tts():
     if not os.path.exists(model_dir):
         raise RuntimeError(f"模型目錄 {model_dir} 不存在")
     
-    print(f">> [系統] 正在初始化 TTS 引擎 (Device: {device}, FP16: {use_fp16})...")
+    # 注意：is_fp16=True 會自動選擇 BF16（H100 支持）或 FP16
+    print(f">> [系統] 正在初始化 TTS 引擎 (Device: {device}, 混合精度: {use_fp16})...")
     try:
         tts = IndexTTS(
             model_dir=model_dir,
             cfg_path=config_path,
             device=device,
-            is_fp16=use_fp16,
-            gpt_path=os.path.abspath("finetune_models/gpt_1211_epoch_9.pth")
+            is_fp16=use_fp16,  # 實際會自動選擇最佳精度（BF16 或 FP16）
+            gpt_path=os.path.abspath("finetune_models/checkpoints/gpt_1211_epoch_9.pth")
         )
         print(">> [系統] TTS 引擎初始化完成")
     except Exception as e:
@@ -176,8 +178,9 @@ async def text_to_speech(
     text: str = Form(...),
     prompt_audio: UploadFile = File(None),
     prompt_audio_path: str = Form(None),
-    infer_mode: str = Form("normal"),
+    infer_mode: str = Form("fast"),
     speaker_id: str = Form(None),
+    seed: int = Form(None), # Added seed argument
     # 進階參數
     max_text_tokens_per_sentence: int = Form(120),
     sentences_bucket_max_size: int = Form(4),
@@ -196,6 +199,15 @@ async def text_to_speech(
     """
     if not tts:
         raise HTTPException(status_code=503, detail="TTS 引擎尚未初始化")
+
+    # Seed 處理
+    if seed is None or seed == -1:
+        actual_seed = random.randint(0, 2**32 - 1)
+    else:
+        actual_seed = seed
+    
+    set_seed(actual_seed)
+    print(f">> [API] 使用 Seed: {actual_seed}")
 
     if not prompt_audio and not prompt_audio_path:
         raise HTTPException(status_code=400, detail="必須提供參考音訊 (上傳檔案或指定路徑)")
@@ -268,7 +280,14 @@ async def text_to_speech(
             # 傳送後刪除 (可選，這裡保留以便除錯，或使用背景任務刪除)
             # os.remove(output_path)
 
-        return StreamingResponse(iterfile(), media_type="audio/wav", headers={"Content-Disposition": f"attachment; filename={output_filename}"})
+        return StreamingResponse(
+            iterfile(), 
+            media_type="audio/wav", 
+            headers={
+                "Content-Disposition": f"attachment; filename={output_filename}",
+                "X-Seed": str(actual_seed)
+            }
+        )
 
     except Exception as e:
         print(f">> [API 錯誤] {str(e)}")

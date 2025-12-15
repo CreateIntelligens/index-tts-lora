@@ -339,6 +339,18 @@ class DDPTrainer:
             logger.info(f"Total samples: {len(train_ds)}")
             logger.info(f"Total update steps (per GPU): {total_update_steps}")
 
+            # 顯示 CFG 配置
+            cfg_dropout_ratio = train_cfg.get('cfg_dropout_ratio', 0.0)
+            if cfg_dropout_ratio > 0:
+                logger.info(f"✓ Classifier-Free Guidance 已啟用 (dropout={cfg_dropout_ratio:.0%})")
+            else:
+                logger.info("✗ Classifier-Free Guidance 未啟用")
+
+            # 顯示 Cross-Speaker 配置
+            cross_speaker_ratio = train_cfg.get('cross_speaker_ratio', 0.0)
+            if cross_speaker_ratio > 0:
+                logger.info(f"✓ Cross-Speaker Conditioning 已啟用 (ratio={cross_speaker_ratio:.0%})")
+
         text_weight = train_cfg.text_weight
 
         for epoch in range(start_epoch, train_cfg.epochs):
@@ -423,6 +435,9 @@ class DDPTrainer:
         # 解包 batch（新增 cond_mels、cond_lengths）
         mel_spec, mel_codes, text_ids, cond_mels, speaker_ids, mel_lengths, codes_lengths, text_lengths, cond_lengths = batch
 
+        # 取得 CFG dropout 比例
+        cfg_dropout_ratio = self.config.train.get('cfg_dropout_ratio', 0.0)
+
         outputs = forward_UnifiedVoice(
             self.model.module,  # DDP 需要使用 .module
             mel_spec,           # target mel（用於 loss）
@@ -437,6 +452,7 @@ class DDPTrainer:
             add_mel_stop_token=self.config.train.get('add_mel_stop_token', True),
             output_loss=True,
             output_logits=True,
+            cfg_dropout_ratio=cfg_dropout_ratio,
         )
 
         loss_text, loss_mel = outputs["loss"]

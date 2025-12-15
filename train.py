@@ -181,6 +181,7 @@ def forward_UnifiedVoice(
     output_logits: bool = True,
     output_latent: bool = False,
     loss_reduction: str = "mean",
+    cfg_dropout_ratio: float = 0.0,
 ):
     """
     執行 UnifiedVoice 模型的完整前向傳播流程。
@@ -201,6 +202,8 @@ def forward_UnifiedVoice(
         output_logits (bool): 是否回傳 logits。
         output_latent (bool): 是否回傳 latent。
         loss_reduction (str): Loss 縮減方式。
+        cfg_dropout_ratio (float): Classifier-Free Guidance dropout 比例。
+            設為 > 0 時，會以該機率將 conditioning 設為零向量。
 
     Returns:
         dict: 包含 loss, logits, targets, mel_accuracy 等結果的字典。
@@ -212,6 +215,11 @@ def forward_UnifiedVoice(
     cond_source = condition_mels if condition_mels is not None else mel_spec
     cond_lengths = condition_lengths if condition_lengths is not None else mel_lengths
     conditioning_latent = actual_model.get_conditioning(cond_source, cond_lengths, speaker_ids=speaker_ids)
+
+    # Classifier-Free Guidance: 以一定機率將 conditioning 設為零向量
+    # 這強迫模型學習「有 conditioning」vs「無 conditioning」的差異
+    if cfg_dropout_ratio > 0 and actual_model.training and random.random() < cfg_dropout_ratio:
+        conditioning_latent = torch.zeros_like(conditioning_latent)
     
     # 構建文字輸入 (加入 start/stop tokens)
     B, T_pad = text_ids.shape
