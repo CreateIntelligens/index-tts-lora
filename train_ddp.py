@@ -51,7 +51,6 @@ from indextts.BigVGAN.models import BigVGAN
 from indextts.data_utils import (
     collate_finetune_fn,
     load_finetune_datasets,
-    load_speaker_conditions,
 )
 from indextts.gpt.model import UnifiedVoice
 
@@ -149,9 +148,6 @@ class DDPTrainer:
         # 載入模型和分詞器
         self._load_models()
 
-        # 載入並註冊 speaker conditions 為可學習參數
-        self._register_speaker_conditions()
-
         # 初始化訓練狀態（optimizer 會在 train() 裡設定）
         self.optimizer = None
         self.scheduler = None
@@ -199,44 +195,6 @@ class DDPTrainer:
 
         if self.is_main_process:
             logger.info(f"✅ Model wrapped with DDP on {self.world_size} GPUs")
-
-    def _register_speaker_conditions(self):
-        """
-        載入並註冊 speaker conditions 為可學習參數。
-
-        原始策略：每個說話人的 mean_condition 作為獨立的可學習參數，
-        與 LoRA 一起訓練，使 conditioning 能被優化以匹配 GPT 的更新。
-        """
-        if self.is_main_process:
-            logger.info("載入 Speaker Conditions...")
-
-        # 從 medoid 文件載入預計算的 conditions
-        self.speaker_conditions = load_speaker_conditions(self.config)
-        self.speaker_list = list(self.speaker_conditions.keys())
-
-        if self.is_main_process:
-            logger.info(f"載入 {len(self.speaker_list)} 個說話人的 conditions")
-
-        # 註冊為可學習參數
-        self.speaker_mean_conditions = {}
-
-        for speaker_id, condition in self.speaker_conditions.items():
-            # 確保形狀正確: (1, 32, dim) 或 (32, dim) -> (1, 32, dim)
-            if condition.ndim == 2:
-                condition = condition.unsqueeze(0)
-            elif condition.ndim == 4:
-                condition = condition.squeeze(0)
-
-            # 註冊為可學習參數（requires_grad=True）
-            param_name = f"mean_condition_{speaker_id}"
-            param = torch.nn.Parameter(condition.to(self.device), requires_grad=True)
-
-            # 註冊到 DDP 模型的底層模組
-            self.model.module.register_parameter(param_name, param)
-            self.speaker_mean_conditions[speaker_id] = param
-
-        if self.is_main_process:
-            logger.info(f"✅ 註冊 {len(self.speaker_mean_conditions)} 個可學習 Speaker Conditions")
 
     def _apply_lora(self, model: UnifiedVoice) -> UnifiedVoice:
         """應用 LoRA 配置"""
@@ -474,12 +432,12 @@ class DDPTrainer:
 
     def _train_step(self, batch: Tuple) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """
-        單個訓練步驟：使用可學習的 speaker_mean_conditions。
+        單個訓練步驟：使用每個樣本預計算的 conditioning。
 
-        策略說明：
-        - 使用 speaker_ids 查找預計算並註冊為可學習參數的 mean_condition
-        - 這些 conditions 會隨 LoRA 一起被優化
-        - 確保 conditioning 與 GPT 之間的對齊關係
+        策略說明（與官方 IndexTTS2 一致）：
+        - 每個樣本使用自己的預計算 condition.npy
+        - Conditioning 是固定的，GPT LoRA 學習如何使用它
+        - 不需要額外的 optimizer 設定
         """
         # 解包 batch
         mel_spec, mel_codes, text_ids, cond_mels, speaker_ids, mel_lengths, codes_lengths, text_lengths, cond_lengths = batch
@@ -495,9 +453,9 @@ class DDPTrainer:
             mel_lengths,
             codes_lengths,
             text_lengths,
-            condition_mels=None,        # 不使用動態 conditioning
-            condition_lengths=None,
-            speaker_ids=speaker_ids,    # 使用可學習的 speaker conditions
+            condition_mels=cond_mels,       # 使用每個樣本預計算的 conditioning
+            condition_lengths=cond_lengths,
+            speaker_ids=None,               # 不用 speaker 查表
             add_mel_stop_token=self.config.train.get('add_mel_stop_token', True),
             output_loss=True,
             output_logits=True,
@@ -585,18 +543,6 @@ class DDPTrainer:
         if self.is_main_process:
             logger.info("✓ Model state loaded")
 
-        # 恢復可學習的 speaker conditions（如果存在）
-        if 'speaker_conditions' in checkpoint:
-            saved_conditions = checkpoint['speaker_conditions']
-            restored_count = 0
-            for speaker_id, condition in saved_conditions.items():
-                if speaker_id in self.speaker_mean_conditions:
-                    # 用儲存的權重覆蓋
-                    self.speaker_mean_conditions[speaker_id].data.copy_(condition.to(self.device))
-                    restored_count += 1
-            if self.is_main_process:
-                logger.info(f"✓ Restored {restored_count} speaker conditions")
-
         # 載入 optimizer 和 scheduler（如果已經初始化）
         if hasattr(self, 'optimizer') and self.optimizer is not None:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -627,12 +573,6 @@ class DDPTrainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'val_text_loss': val_text_loss,
             'val_mel_loss': val_mel_loss,
-            # 儲存可學習的 speaker conditions
-            'speakers': self.speaker_list,
-            'speaker_conditions': {
-                speaker_id: param.detach().cpu()
-                for speaker_id, param in self.speaker_mean_conditions.items()
-            },
         }, checkpoint_path)
         logger.info(f"💾 Training checkpoint saved: {checkpoint_path}")
 
@@ -669,27 +609,10 @@ class DDPTrainer:
         state_dict = model_to_save.state_dict()
         filtered_state_dict = {k: v for k, v in state_dict.items() if not k.startswith('inference_model')}
 
-        # 轉換 speaker_conditions 為相同精度
-        def convert_dtype(tensor):
-            if save_dtype == "fp16":
-                return tensor.half()
-            elif save_dtype == "bf16":
-                return tensor.bfloat16()
-            return tensor
-
-        checkpoint_data = {
-            'model': filtered_state_dict,
-            # 儲存可學習的 speaker conditions（推理時需要）
-            'speakers': self.speaker_list,
-            'speaker_conditions': {
-                speaker_id: convert_dtype(param.detach().cpu())
-                for speaker_id, param in self.speaker_mean_conditions.items()
-            },
-        }
+        checkpoint_data = {'model': filtered_state_dict}
 
         torch.save(checkpoint_data, merged_model_path)
         logger.info(f"💾 Merged model saved: {merged_model_path}")
-        logger.info(f"   包含 {len(self.speaker_mean_conditions)} 個 speaker conditions")
 
         # 清理深複製
         del model_to_save
