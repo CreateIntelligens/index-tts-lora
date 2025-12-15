@@ -195,7 +195,7 @@ train:
     #   - 0.20 : 20% 機率 drop conditioning (較強)
     #
     # 注意: CFG 與 cross_speaker 可以同時使用，但建議先單獨測試 CFG。
-    cfg_dropout_ratio: 0.15
+    cfg_dropout_ratio: 0.0   # 先測試可學習 speaker conditions，暫不使用 CFG
 
     # =========================================================================
     # 文字長度過濾與加權 (暫時停用以驗證模型架構)

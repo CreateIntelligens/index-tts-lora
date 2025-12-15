@@ -212,8 +212,17 @@ def forward_UnifiedVoice(
     actual_model = model.module if isinstance(model, nn.DataParallel) else model
 
     # 處理條件輸入來源
-    cond_source = condition_mels if condition_mels is not None else mel_spec
-    cond_lengths = condition_lengths if condition_lengths is not None else mel_lengths
+    # 當有 speaker_ids 時，使用預計算的可學習 conditioning（不需要 mel 輸入）
+    # 否則使用動態 conditioning（從 mel 輸入計算）
+    if speaker_ids is not None:
+        # 使用可學習的 speaker mean_conditions
+        cond_source = None
+        cond_lengths = None
+    else:
+        # 使用動態 conditioning
+        cond_source = condition_mels if condition_mels is not None else mel_spec
+        cond_lengths = condition_lengths if condition_lengths is not None else mel_lengths
+
     conditioning_latent = actual_model.get_conditioning(cond_source, cond_lengths, speaker_ids=speaker_ids)
 
     # Classifier-Free Guidance: 以一定機率將 conditioning 設為零向量
