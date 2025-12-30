@@ -88,6 +88,7 @@ app = FastAPI(
 
 # 掛載靜態檔案
 app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/tests", StaticFiles(directory="tests"), name="tests")
 
 @app.get("/")
 async def read_index():

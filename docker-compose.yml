@@ -18,7 +18,7 @@ services:
     # 環境變數
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-      - CUDA_VISIBLE_DEVICES=4,5,6,7  # 多卡主機可取消註解並指定 GPU
+      # - CUDA_VISIBLE_DEVICES=4,5,6,7  # 多卡主機可取消註解並指定 GPU
       - UID=${UID:-1000}
       - GID=${GID:-1000}
       - USERNAME=${USER:-user}
@@ -29,10 +29,9 @@ services:
 
     # 端口映射
     ports:
-      - "7860:7860"  # webui
+      # - "7860:7860"  # webui
       - "7859:7859"  # api.py
       - "8006:8006"  # tensorboard
-      - "7859:7859"  # API Port
 
     # 掛載卷 - 掛載整個專案目錄
     volumes:
@@ -47,8 +46,8 @@ services:
     # 共享內存大小（DataLoader 多進程需要）
     shm_size: '128gb'
 
-    # 同時啟動 API (7859) 和 WebUI (7860)
-    command: bash scripts/start_all.sh
+    # 啟動 API Server
+    command: python3 api.py --host 0.0.0.0 --port 7859
 
     # 自動重啟策略（包含健康檢查失敗時）
     restart: unless-stopped

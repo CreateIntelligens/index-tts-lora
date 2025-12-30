@@ -121,14 +121,15 @@
                                 <i class="ph ph-x"></i>
                             </button>
                         </div>
-                        
-                        <!-- 預覽播放器 -->
+
+                        <!-- 預覽播放器 - 上傳檔案 -->
                         <audio ref="previewPlayer" controls class="w-full h-8 block custom-audio" v-if="previewUrl">
                             <source :src="previewUrl" type="audio/wav">
                         </audio>
-                        <p v-else class="text-xs text-slate-500 italic text-center">
-                            (伺服器檔案暫不支援預覽)
-                        </p>
+                        <!-- 預覽播放器 - 伺服器檔案 -->
+                        <audio controls class="w-full h-8 block custom-audio" v-else-if="serverPromptPath" :key="serverPromptPath">
+                            <source :src="'/' + serverPromptPath" type="audio/wav">
+                        </audio>
                     </div>
                     
                     <!-- 預設範例 -->
@@ -274,7 +275,7 @@
 
         createApp({
             setup() {
-                const inputText = ref("");
+                const inputText = ref("大家好，我是一個語音合成模型，可以將文字轉換成自然流暢的語音。");
                 const isGenerating = ref(false);
                 const models = ref([]);
                 const selectedModel = ref("");
