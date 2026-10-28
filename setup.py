@@ -47,7 +47,7 @@ setup(
     install_requires=[
         "torch>=2.1.2",
         "torchaudio",
-        "transformers==4.44.2",  # 升級以支援 peft 0.13.2
+        "transformers==5.10.1",  # 升級以支援 peft 0.13.2
         "peft==0.13.2",  # 兼容訓練和推理的版本
         "accelerate",
         "tokenizers>=0.15.0",  # 放寬版本限制
